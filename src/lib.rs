@@ -53,6 +53,8 @@ fn mcpe_options(compression_level: u8) -> Options {
     list.set_with_id(4, RawZlibCompressor::new(compression_level));
     opt.compressor_list = Rc::new(list);
     opt.compressor = 4;
+    opt.reuse_logs = false;
+    opt.reuse_manifest = false;
     opt
 }
 
