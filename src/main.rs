@@ -2,6 +2,7 @@ use std::path::Path;
 use world_inspector::WorldHandle;
 use std::rc::Rc;
 
+use base64::{Engine as _, engine::general_purpose};
 use bedrock_nbt::{CompoundTag, Tag};
 use miniz_oxide::deflate::{compress_to_vec, compress_to_vec_zlib, CompressionLevel};
 use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
@@ -59,6 +60,11 @@ enum Command {
     ListPlayers { world_path: String },
     ListActors { world_path: String },
     ShowPlayer { world_path: String, player_key: String, dump: bool, json: bool },
+    WipeActors { world_path: String, include_players: bool },
+    ExportActors { world_path: String, output_file: String, no_players: bool },
+    ExportChunks { world_path: String, output_file: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32 },
+    ImportActors { world_path: String, input_file: String, skip_existing: bool },
+    ImportChunks { world_path: String, input_file: String, skip_existing: bool },
 }
 
 fn print_help() {
@@ -68,6 +74,12 @@ fn print_help() {
        world-inspector <world_path> --players
        world-inspector <world_path> --actors
        world-inspector <world_path> --player <key>
+       world-inspector <world_path> --wipe-actors [--include-players]
+       world-inspector <world_path> --export-actors <file> [--no-players]
+       world-inspector <world_path> --export-chunks <file> <bx> <bz>
+       world-inspector <world_path> --export-chunks <file> <bx1> <bz1> <bx2> <bz2>
+       world-inspector <world_path> --import-chunks <file> [--skip-existing]
+       world-inspector <world_path> --import-actors <file> [--skip-existing]
 
 查询坐标方块：
   world-inspector /path/to/world -3 -60 -3          查主世界方块
@@ -86,6 +98,20 @@ fn print_help() {
   world-inspector /path/to/world --player player_<UUID>
   world-inspector /path/to/world --player <key> --dump  转储完整 NBT 原始数据
   world-inspector /path/to/world --player <key> --json  以 JSON 格式输出背包数据
+
+实体管理：
+  world-inspector /path/to/world --wipe-actors                  擦除非玩家实体
+  world-inspector /path/to/world --wipe-actors --include-players 擦除全部实体（含玩家数据）
+  world-inspector /path/to/world --export-actors <file>         导出实体到 JSON 文件（含玩家）
+  world-inspector /path/to/world --export-actors <file> --no-players  导出仅非玩家实体
+  world-inspector /path/to/world --import-actors <file>         从 JSON 导入实体（覆盖）
+  world-inspector /path/to/world --import-actors <file> --skip-existing  跳过已存在实体
+
+区块管理：
+  world-inspector /path/to/world --export-chunks <file> <bx> <bz>            导出单区块(方块坐标)
+  world-inspector /path/to/world --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
+  world-inspector /path/to/world --import-chunks <file>           从 JSON 导入区块（覆盖）
+  world-inspector /path/to/world --import-chunks <file> --skip-existing  跳过已存在 key
 ");
 }
 
@@ -112,6 +138,44 @@ fn parse_args() -> Result<Command, String> {
         let dump = remaining.contains(&&"--dump".to_string()) || remaining.contains(&&"-d".to_string());
         let json = remaining.contains(&&"--json".to_string()) || remaining.contains(&&"-j".to_string());
         return Ok(Command::ShowPlayer { world_path, player_key: args[3].clone(), dump, json });
+    }
+
+    if args.len() >= 3 && args[2] == "--wipe-actors" {
+        let include_players = args[3..].iter().any(|a| a == "--include-players");
+        return Ok(Command::WipeActors { world_path, include_players });
+    }
+
+    if args.len() >= 4 && args[2] == "--export-actors" {
+        let no_players = args[4..].iter().any(|a| a == "--no-players");
+        return Ok(Command::ExportActors { world_path, output_file: args[3].clone(), no_players });
+    }
+
+    if args.len() >= 4 && args[2] == "--import-actors" {
+        let skip_existing = args[4..].iter().any(|a| a == "--skip-existing");
+        return Ok(Command::ImportActors { world_path, input_file: args[3].clone(), skip_existing });
+    }
+
+    if args.len() >= 4 && args[2] == "--export-chunks" {
+        let file = args[3].clone();
+        let extra: Vec<&String> = args[4..].iter().collect();
+        if extra.len() == 2 {
+            let bx = extra[0].parse::<i32>().map_err(|_| format!("bx 格式错误: '{}'", extra[0]))?;
+            let bz = extra[1].parse::<i32>().map_err(|_| format!("bz 格式错误: '{}'", extra[1]))?;
+            return Ok(Command::ExportChunks { world_path, output_file: file, bx1: bx, bz1: bz, bx2: bx, bz2: bz });
+        } else if extra.len() == 4 {
+            let bx1 = extra[0].parse::<i32>().map_err(|_| format!("bx1 格式错误: '{}'", extra[0]))?;
+            let bz1 = extra[1].parse::<i32>().map_err(|_| format!("bz1 格式错误: '{}'", extra[1]))?;
+            let bx2 = extra[2].parse::<i32>().map_err(|_| format!("bx2 格式错误: '{}'", extra[2]))?;
+            let bz2 = extra[3].parse::<i32>().map_err(|_| format!("bz2 格式错误: '{}'", extra[3]))?;
+            return Ok(Command::ExportChunks { world_path, output_file: file, bx1, bz1, bx2, bz2 });
+        } else {
+            return Err("区块导出需要 2 个坐标(单区块) 或 4 个坐标(范围)".into());
+        }
+    }
+
+    if args.len() >= 4 && args[2] == "--import-chunks" {
+        let skip_existing = args[4..].iter().any(|a| a == "--skip-existing");
+        return Ok(Command::ImportChunks { world_path, input_file: args[3].clone(), skip_existing });
     }
 
     if args.len() == 2 {
@@ -632,6 +696,250 @@ fn db_summary(db: &mut DB) {
     }
 }
 
+// ── Entity management ──
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err("hex string length must be even".into());
+    }
+    (0..s.len()).step_by(2).map(|i| {
+        u8::from_str_radix(&s[i..i+2], 16)
+            .map_err(|_| format!("invalid hex at position {}", i))
+    }).collect()
+}
+
+fn cmd_export_actors(db: &mut DB, output_file: &str, no_players: bool) {
+    // Collect entity-related keys:
+    //   actorprefix*  — entity NBT data
+    //   digp*         — entity digest / chunk linkage
+    //   player_*, ~*  — player data (omitted if no_players)
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => { eprintln!("错误: 无法创建 DB 迭代器"); std::process::exit(1); }
+    };
+    iter.seek_to_first();
+    while let Some((key, value)) = iter.next() {
+        let is_actorprefix = key.starts_with(b"actorprefix");
+        let is_digp = key.starts_with(b"digp");
+        let is_player_data = key.starts_with(b"player_") || key.starts_with(b"~");
+
+        if is_actorprefix {
+            // Determine if this actor is a player
+            let is_player_actor = CompoundTag::from_binary_nbt(&value, true).ok()
+                .map(|(tag, _)| tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string())))
+                .flatten()
+                .as_deref()
+                == Some("minecraft:player");
+
+            // Skip player actors when --no-players
+            if no_players && is_player_actor {
+                continue;
+            }
+
+            counts.entry("actors").or_insert(0);
+            *counts.get_mut("actors").unwrap() += 1;
+            let identifier = if is_player_actor { Some("minecraft:player".to_string()) } else {
+                CompoundTag::from_binary_nbt(&value, true).ok().and_then(|(tag, _)| {
+                    tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string()))
+                        .or_else(|| tag.get("id").and_then(|t| t.as_str().map(|s| s.to_string())))
+                })
+            };
+            entries.push(serde_json::json!({
+                "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
+                "identifier": identifier,
+            }));
+        } else if is_digp {
+            *counts.entry("digp").or_insert(0) += 1;
+            entries.push(serde_json::json!({
+                "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
+            }));
+        } else if is_player_data && !no_players {
+            *counts.entry("players").or_insert(0) += 1;
+            entries.push(serde_json::json!({
+                "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
+            }));
+        }
+    }
+
+    if entries.is_empty() {
+        println!("  未找到实体数据，导出空文件");
+    }
+
+    let total = entries.len();
+    let export = serde_json::json!({
+        "total": total,
+        "entries": entries,
+    });
+
+    let json_str = serde_json::to_string_pretty(&export)
+        .unwrap_or_else(|e| { eprintln!("错误: JSON 序列化失败: {}", e); std::process::exit(1); });
+    std::fs::write(output_file, &json_str)
+        .unwrap_or_else(|e| { eprintln!("错误: 写入文件失败: {}", e); std::process::exit(1); });
+
+    print!("  已导出 {} 条记录", total);
+    for (cat, n) in &counts {
+        print!(", {}: {}", cat, n);
+    }
+    println!("  → {}", output_file);
+}
+
+fn cmd_import_actors(db: &mut DB, input_file: &str, skip_existing: bool) {
+    let json_str = std::fs::read_to_string(input_file)
+        .unwrap_or_else(|e| { eprintln!("错误: 读取文件失败: {}", e); std::process::exit(1); });
+    let data: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| { eprintln!("错误: JSON 解析失败: {}", e); std::process::exit(1); });
+
+    let total = data["total"].as_u64().unwrap_or(0) as usize;
+    let entries = match data["entries"].as_array() {
+        Some(arr) => arr,
+        None => { eprintln!("错误: JSON 格式无效，缺少 entries 字段"); std::process::exit(1); }
+    };
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+
+    for entry in entries {
+        let key_hex = entry["key_hex"].as_str()
+            .unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+        let value_b64 = entry["value_base64"].as_str()
+            .unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
+
+        let key = hex_decode(key_hex)
+            .unwrap_or_else(|e| { eprintln!("错误: key 解析失败 ({}): {}", key_hex, e); std::process::exit(1); });
+        let value = general_purpose::STANDARD.decode(value_b64)
+            .unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
+
+        if skip_existing {
+            if db.get(&key).is_some() {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        db.put(&key, &value)
+            .unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
+        imported += 1;
+    }
+
+    println!("  导入完成: 总数 {}, 已导入 {}, 已跳过 {}", total, imported, skipped);
+}
+
+// ── Chunk management ──
+
+fn collect_chunk_keys(db: &mut DB, cx: i32, cz: i32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut results = Vec::new();
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => return results,
+    };
+    let mut seek_key = Vec::with_capacity(8);
+    seek_key.extend_from_slice(&cx.to_le_bytes());
+    seek_key.extend_from_slice(&cz.to_le_bytes());
+    iter.seek(&seek_key);
+    while let Some((key, value)) = iter.next() {
+        if key.len() < 8 { continue; }
+        let kcx = i32::from_le_bytes(key[0..4].try_into().unwrap());
+        let kcz = i32::from_le_bytes(key[4..8].try_into().unwrap());
+        if kcx != cx || kcz != cz { break; }
+        results.push((key, value));
+    }
+    results
+}
+
+fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i32, bz2: i32) {
+    let cx1 = bx1.div_euclid(16);
+    let cz1 = bz1.div_euclid(16);
+    let cx2 = bx2.div_euclid(16);
+    let cz2 = bz2.div_euclid(16);
+    let (cxa, cxb) = if cx1 <= cx2 { (cx1, cx2) } else { (cx2, cx1) };
+    let (cza, czb) = if cz1 <= cz2 { (cz1, cz2) } else { (cz2, cz1) };
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut chunk_list: Vec<String> = Vec::new();
+    let _total_count = (cxb - cxa + 1) * (czb - cza + 1);
+    let mut current = 0;
+
+    for cx in cxa..=cxb {
+        for cz in cza..=czb {
+            let keys = collect_chunk_keys(db, cx, cz);
+            if keys.is_empty() { continue; }
+            current += 1;
+            chunk_list.push(format!("{},{}", cx, cz));
+            for (key, value) in &keys {
+                entries.push(serde_json::json!({
+                    "key_hex": hex_encode(key),
+                    "value_base64": general_purpose::STANDARD.encode(value),
+                }));
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        println!("  未找到区块数据，导出空文件");
+    }
+
+    let export = serde_json::json!({
+        "total": entries.len(),
+        "chunks": chunk_list,
+        "entries": entries,
+    });
+
+    let json_str = serde_json::to_string_pretty(&export)
+        .unwrap_or_else(|e| { eprintln!("错误: JSON 序列化失败: {}", e); std::process::exit(1); });
+    std::fs::write(output_file, &json_str)
+        .unwrap_or_else(|e| { eprintln!("错误: 写入文件失败: {}", e); std::process::exit(1); });
+
+    println!("  已导出 {} 个区块 (区块坐标 {}/{} ~ {}/{}) 共 {} 条记录 → {}",
+        current, cxa, cza, cxb, czb, entries.len(), output_file);
+}
+
+fn cmd_import_chunks_inner(db: &mut DB, input_file: &str, skip_existing: bool) {
+    let json_str = std::fs::read_to_string(input_file)
+        .unwrap_or_else(|e| { eprintln!("错误: 读取文件失败: {}", e); std::process::exit(1); });
+    let data: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| { eprintln!("错误: JSON 解析失败: {}", e); std::process::exit(1); });
+
+    let entries = match data["entries"].as_array() {
+        Some(arr) => arr,
+        None => { eprintln!("错误: JSON 格式无效，缺少 entries 字段"); std::process::exit(1); }
+    };
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+
+    for entry in entries {
+        let key_hex = entry["key_hex"].as_str()
+            .unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+        let value_b64 = entry["value_base64"].as_str()
+            .unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
+
+        let key = hex_decode(key_hex)
+            .unwrap_or_else(|e| { eprintln!("错误: key 解析失败 ({}): {}", key_hex, e); std::process::exit(1); });
+        let value = general_purpose::STANDARD.decode(value_b64)
+            .unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
+
+        if skip_existing && db.get(&key).is_some() {
+            skipped += 1;
+            continue;
+        }
+
+        db.put(&key, &value)
+            .unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
+        imported += 1;
+    }
+
+    let total = data["total"].as_u64().unwrap_or(0) as usize;
+    println!("  导入完成: 总数 {}, 已导入 {}, 已跳过 {}", total, imported, skipped);
+}
+
 // ── Main ──
 
 fn main() {
@@ -642,7 +950,9 @@ fn main() {
 
     let (world_path, dim_id, _dim_name) = match &cmd {
         Command::QueryBlock { world_path, dim_id, dim_name, .. } => (world_path.as_str(), *dim_id, dim_name.as_str()),
-        Command::ShowInfo { world_path } | Command::ListPlayers { world_path } | Command::ListActors { world_path } | Command::ShowPlayer { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
+        Command::ShowInfo { world_path } | Command::ListPlayers { world_path } | Command::ListActors { world_path } | Command::ShowPlayer { world_path, .. }
+            | Command::WipeActors { world_path, .. } | Command::ExportActors { world_path, .. } | Command::ExportChunks { world_path, .. }
+            | Command::ImportActors { world_path, .. } | Command::ImportChunks { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
     };
 
     if !Path::new(world_path).is_dir() {
@@ -673,6 +983,103 @@ fn main() {
         None => { eprintln!("错误: 找不到 LevelDB 数据"); std::process::exit(1); }
     };
 
+    // ─── Write commands: open DB in write mode directly ───
+    match cmd {
+        Command::ImportActors { ref input_file, skip_existing, .. } => {
+            let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
+            opt.read_only = false;
+            let mut db = match DB::open(&db_path, opt) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
+            };
+            cmd_import_actors(&mut db, input_file, skip_existing);
+            println!();
+            std::process::exit(0);
+        }
+        Command::WipeActors { include_players, .. } => {
+            // Phase 1: collect keys to delete from read-only DB
+            let mut opt_ro = mcpe_options(CompressionLevel::DefaultLevel as u8);
+            opt_ro.read_only = true;
+            let mut db_ro = match DB::open(&db_path, opt_ro) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
+            };
+
+            let mut to_delete: Vec<Vec<u8>> = Vec::new();
+
+            // Collect actorprefix entries
+            let actors = scan_actor_keys(&mut db_ro);
+            for (key, value) in &actors {
+                let is_player = CompoundTag::from_binary_nbt(value, true).ok()
+                    .and_then(|(tag, _)| tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string())))
+                    == Some("minecraft:player".to_string());
+
+                if include_players || !is_player {
+                    to_delete.push(key.clone());
+                }
+            }
+
+            if include_players {
+                // Collect player_*, ~* keys
+                for prefix in &[b"~local_player" as &[u8], b"~player_", b"player_"] {
+                    if let Ok(mut iter) = db_ro.new_iter() {
+                        iter.seek(prefix);
+                        while let Some((key, _)) = iter.next() {
+                            if !key.starts_with(prefix) { break; }
+                            if *prefix == b"player_" && key.starts_with(b"player_server_") { continue; }
+                            to_delete.push(key);
+                        }
+                    }
+                }
+                // player_server_* keys
+                if let Ok(mut iter) = db_ro.new_iter() {
+                    iter.seek(b"player_server_");
+                    while let Some((key, _)) = iter.next() {
+                        if !key.starts_with(b"player_server_") { break; }
+                        to_delete.push(key);
+                    }
+                }
+            }
+
+            let collected = to_delete.len();
+            drop(db_ro);
+
+            // Phase 2: open write-mode and delete
+            let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
+            opt.read_only = false;
+            let mut db = match DB::open(&db_path, opt) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("错误: 无法以写模式打开 DB: {}", e); std::process::exit(1); }
+            };
+
+            let actual_deleted = to_delete.iter().filter(|k| db.get(k).is_some()).count();
+            for key in &to_delete {
+                let _ = db.delete(key);
+            }
+
+            if include_players {
+                println!("  已擦除全部实体(含玩家数据): 收集 {} 条, 实际删除 {}", collected, actual_deleted);
+            } else {
+                println!("  已擦除非玩家实体: 收集 {} 条, 实际删除 {}", collected, actual_deleted);
+            }
+            println!();
+            std::process::exit(0);
+        }
+        Command::ImportChunks { ref input_file, skip_existing, .. } => {
+            let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
+            opt.read_only = false;
+            let mut db = match DB::open(&db_path, opt) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
+            };
+            cmd_import_chunks_inner(&mut db, input_file, skip_existing);
+            println!();
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+
+    // ─── Read-only commands: open DB in read-only mode ───
     let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
     opt.read_only = true;
     let mut db = match DB::open(&db_path, opt) {
@@ -680,7 +1087,6 @@ fn main() {
         Err(e) => { eprintln!("  DB 打开失败: {}", e); std::process::exit(1); }
     };
 
-    // ─── Dispatch ───
     match cmd {
         Command::QueryBlock { x: tx, y: ty, z: tz, .. } => {
             let cx = floor_div(tx, 16); let cz = floor_div(tz, 16);
@@ -907,6 +1313,18 @@ fn main() {
                 eprintln!("\n提示: 用 --player <UUID> 搜索，或用 --actors 列出所有实体");
                 std::process::exit(1);
             }
+        }
+
+        Command::ExportActors { ref output_file, no_players, .. } => {
+            cmd_export_actors(&mut db, output_file, no_players);
+        }
+
+        Command::ExportChunks { ref output_file, bx1, bz1, bx2, bz2, .. } => {
+            cmd_export_chunks(&mut db, output_file, bx1, bz1, bx2, bz2);
+        }
+
+        Command::ImportActors { .. } | Command::WipeActors { .. } | Command::ImportChunks { .. } => {
+            unreachable!()
         }
     }
 
