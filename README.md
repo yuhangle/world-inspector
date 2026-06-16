@@ -40,6 +40,9 @@ world-inspector <世界路径> --export-chunks <file> <bx> <bz>                �
 world-inspector <世界路径> --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
 world-inspector <世界路径> --import-chunks <file>               从 JSON 导入区块（覆盖）
 world-inspector <世界路径> --import-chunks <file> --skip-existing  导入区块（跳过已存在）
+
+实体密度分析：
+world-inspector <世界路径> --entity-density [N]              按 N×N 区块组统计实体密度 Top 5
 ```
 
 ### 示例
@@ -86,6 +89,9 @@ world-inspector /world --export-chunks chunks.json -100 64 200 128
 
 # 导入区块到目标存档
 world-inspector /target-world --import-chunks chunks.json
+
+# 实体密度分析（按 2×2 区块组，显示实体最密集的前 5 个区域）
+world-inspector /world --entity-density 2
 ```
 
 ## 跨存档数据迁移

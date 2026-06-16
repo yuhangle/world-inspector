@@ -7,6 +7,7 @@ use bedrock_nbt::{CompoundTag, Tag};
 use miniz_oxide::deflate::{compress_to_vec, compress_to_vec_zlib, CompressionLevel};
 use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
 use rusty_leveldb::compressor::NoneCompressor;
+use rayon::prelude::*;
 use rusty_leveldb::{Compressor, CompressorList, LdbIterator, Options, DB};
 
 // ── Compressors (kept for CLI-specific DB operations) ──
@@ -65,6 +66,7 @@ enum Command {
     ExportChunks { world_path: String, output_file: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32 },
     ImportActors { world_path: String, input_file: String, skip_existing: bool },
     ImportChunks { world_path: String, input_file: String, skip_existing: bool },
+    EntityDensity { world_path: String, group_size: u32 },
 }
 
 fn print_help() {
@@ -80,6 +82,7 @@ fn print_help() {
        world-inspector <world_path> --export-chunks <file> <bx1> <bz1> <bx2> <bz2>
        world-inspector <world_path> --import-chunks <file> [--skip-existing]
        world-inspector <world_path> --import-actors <file> [--skip-existing]
+       world-inspector <world_path> --entity-density [N]
 
 查询坐标方块：
   world-inspector /path/to/world -3 -60 -3          查主世界方块
@@ -112,6 +115,11 @@ fn print_help() {
   world-inspector /path/to/world --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
   world-inspector /path/to/world --import-chunks <file>           从 JSON 导入区块（覆盖）
   world-inspector /path/to/world --import-chunks <file> --skip-existing  跳过已存在 key
+
+实体密度分析：
+  world-inspector /path/to/world --entity-density          按单区块统计实体密度 Top 5
+  world-inspector /path/to/world --entity-density 2        按 2×2 区块组统计
+  world-inspector /path/to/world --entity-density 4        按 4×4 区块组统计
 ");
 }
 
@@ -176,6 +184,18 @@ fn parse_args() -> Result<Command, String> {
     if args.len() >= 4 && args[2] == "--import-chunks" {
         let skip_existing = args[4..].iter().any(|a| a == "--skip-existing");
         return Ok(Command::ImportChunks { world_path, input_file: args[3].clone(), skip_existing });
+    }
+
+    if args.len() >= 3 && args[2] == "--entity-density" {
+        let group_size = if args.len() >= 4 {
+            args[3].parse::<u32>().map_err(|_| format!("区块组大小格式错误: '{}'", args[3]))?
+        } else {
+            1
+        };
+        if group_size == 0 || group_size > 256 {
+            return Err("区块组大小必须在 1-256 之间".into());
+        }
+        return Ok(Command::EntityDensity { world_path, group_size });
     }
 
     if args.len() == 2 {
@@ -832,6 +852,119 @@ fn cmd_import_actors(db: &mut DB, input_file: &str, skip_existing: bool) {
     println!("  导入完成: 总数 {}, 已导入 {}, 已跳过 {}", total, imported, skipped);
 }
 
+// ── Entity density analysis ──
+
+struct EntityRecord {
+    dim: u8,
+    group_x: i32,
+    group_z: i32,
+    identifier: String,
+}
+
+fn dim_label(dim: u8) -> &'static str {
+    match dim { 0 => "主世界", 1 => "下界", 2 => "末地", _ => "?" }
+}
+
+fn cmd_entity_density(db: &mut DB, group_size: u32) {
+    // Phase 1: scan all actorprefix entries (sequential — DB iterator not Send)
+    let actors = scan_actor_keys(db);
+    let total = actors.len();
+    if total == 0 {
+        println!("\n═══ 区块实体密度分析 ═══\n  存档中无实体数据");
+        return;
+    }
+    eprintln!("  已收集 {} 个实体，正在并行解码 NBT...", total);
+
+    // Phase 2: parallel NBT decode + position/dimension extraction
+    let records: Vec<EntityRecord> = actors.par_iter().filter_map(|(_key, value)| {
+        let tag = CompoundTag::from_binary_nbt(value, true).ok()?.0;
+
+        let identifier = tag.get("identifier")
+            .or_else(|| tag.get("id"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let dim = tag.get("DimensionId")
+            .or_else(|| tag.get("Dimension"))
+            .and_then(|t| match t {
+                Tag::Byte(v) => Some(*v as u8),
+                Tag::Short(v) => Some(*v as u8),
+                Tag::Int(v) => Some(*v as u8),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        let pos = tag.get("Pos")?;
+        let Tag::List(lv) = pos else { return None; };
+        if lv.elements.len() < 3 { return None; }
+        let x = tag_to_f64(&lv.elements[0])?;
+        let z = tag_to_f64(&lv.elements[2])?;
+
+        let cx = (x as i64 as i32).div_euclid(16);
+        let cz = (z as i64 as i32).div_euclid(16);
+        let gx = cx.div_euclid(group_size as i32);
+        let gz = cz.div_euclid(group_size as i32);
+
+        Some(EntityRecord { dim, group_x: gx, group_z: gz, identifier })
+    }).collect();
+
+    // Phase 3: aggregate by (dimension, group)
+    #[derive(Default)]
+    struct GroupStat {
+        count: usize,
+        types: std::collections::HashMap<String, usize>,
+    }
+
+    let mut groups: std::collections::HashMap<(u8, i32, i32), GroupStat> = std::collections::HashMap::new();
+    for rec in &records {
+        let key = (rec.dim, rec.group_x, rec.group_z);
+        let stat = groups.entry(key).or_default();
+        stat.count += 1;
+        *stat.types.entry(rec.identifier.clone()).or_insert(0) += 1;
+    }
+
+    // Phase 4: top 5
+    let mut sorted: Vec<_> = groups.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+    // Per-dimension stats
+    let mut dim_counts: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
+    for rec in &records {
+        *dim_counts.entry(rec.dim).or_insert(0) += 1;
+    }
+
+    let gs = group_size;
+    println!("\n═══ 区块实体密度 Top 5 ({}×{} 区块组) ═══", gs, gs);
+    print!("  实体总数: {}", total);
+    for (d, n) in &dim_counts {
+        print!("  {}: {}", dim_label(*d), n);
+    }
+    println!("  区块组: {}", sorted.len());
+
+    for (rank, ((dim, gx, gz), stat)) in sorted.iter().take(5).enumerate() {
+        let cx_min = gx * gs as i32;
+        let cz_min = gz * gs as i32;
+        let cx_max = cx_min + gs as i32 - 1;
+        let cz_max = cz_min + gs as i32 - 1;
+        let mid_cx = (cx_min + cx_max) / 2;
+        let mid_cz = (cz_min + cz_max) / 2;
+        let mid_bx = mid_cx * 16 + 8;
+        let mid_bz = mid_cz * 16 + 8;
+
+        println!("\n  #{}  [{}] 区块组 ({}, {}) ~ ({}, {})  中点方块 ({}, {})",
+            rank + 1, dim_label(*dim), cx_min, cz_min, cx_max, cz_max, mid_bx, mid_bz);
+        println!("      实体总数: {}", stat.count);
+
+        let mut top_types: Vec<_> = stat.types.iter().collect();
+        top_types.sort_by(|a, b| b.1.cmp(a.1));
+        println!("      Top 实体:");
+        for (t, n) in top_types.iter().take(5) {
+            println!("        {}: {}", t, n);
+        }
+    }
+}
+
 // ── Chunk management ──
 
 fn collect_chunk_keys(db: &mut DB, cx: i32, cz: i32) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -952,7 +1085,8 @@ fn main() {
         Command::QueryBlock { world_path, dim_id, dim_name, .. } => (world_path.as_str(), *dim_id, dim_name.as_str()),
         Command::ShowInfo { world_path } | Command::ListPlayers { world_path } | Command::ListActors { world_path } | Command::ShowPlayer { world_path, .. }
             | Command::WipeActors { world_path, .. } | Command::ExportActors { world_path, .. } | Command::ExportChunks { world_path, .. }
-            | Command::ImportActors { world_path, .. } | Command::ImportChunks { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
+            | Command::ImportActors { world_path, .. } | Command::ImportChunks { world_path, .. }
+            | Command::EntityDensity { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
     };
 
     if !Path::new(world_path).is_dir() {
@@ -1321,6 +1455,10 @@ fn main() {
 
         Command::ExportChunks { ref output_file, bx1, bz1, bx2, bz2, .. } => {
             cmd_export_chunks(&mut db, output_file, bx1, bz1, bx2, bz2);
+        }
+
+        Command::EntityDensity { group_size, .. } => {
+            cmd_entity_density(&mut db, group_size);
         }
 
         Command::ImportActors { .. } | Command::WipeActors { .. } | Command::ImportChunks { .. } => {
