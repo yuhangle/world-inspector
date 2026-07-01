@@ -100,15 +100,10 @@ pub struct WorldHandle {
 impl WorldHandle {
     /// Open a Bedrock world by its world path (the directory containing level.dat).
     pub fn open(world_path: &str) -> Result<Self, String> {
-        let db_candidates = resolve_db_path(world_path, 0);
-        let mut db_path = None;
-        for c in &db_candidates {
-            if Path::new(c).is_dir() && Path::new(&format!("{}/CURRENT", c)).exists() {
-                db_path = Some(c.clone());
-                break;
-            }
+        let db_path = resolve_db_path(world_path, 0);
+        if !Path::new(&db_path).is_dir() || !Path::new(&format!("{}/CURRENT", db_path)).exists() {
+            return Err("LevelDB directory not found".to_string());
         }
-        let db_path = db_path.ok_or_else(|| "LevelDB directory not found".to_string())?;
 
         let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
         opt.read_only = true;
@@ -203,14 +198,9 @@ impl WorldHandle {
 
 // ── Internal helpers ──
 
-fn resolve_db_path(world_path: &str, dim_id: u8) -> Vec<String> {
-    let base = world_path.trim_end_matches('/');
-    match dim_id {
-        0 => vec![format!("{}/db", base)],
-        1 => vec![format!("{}/DIM-1/db", base), format!("{}/db", base)],
-        2 => vec![format!("{}/DIM1/db", base), format!("{}/db", base)],
-        _ => vec![format!("{}/db", base)],
-    }
+/// Bedrock 版所有维度共享同一个 db 文件夹。
+fn resolve_db_path(world_path: &str, _dim_id: u8) -> String {
+    format!("{}/db", world_path.trim_end_matches('/'))
 }
 
 fn tag_to_i32(tag: &Tag) -> Option<i32> {

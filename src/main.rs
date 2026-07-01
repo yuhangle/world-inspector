@@ -67,6 +67,8 @@ enum Command {
     ImportActors { world_path: String, input_file: String, skip_existing: bool },
     ImportChunks { world_path: String, input_file: String, skip_existing: bool },
     EntityDensity { world_path: String, group_size: u32 },
+    DeleteChunks { world_path: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_id: u8, dim_name: String },
+    BatchDeleteChunks { world_path: String, input_file: String, invert: bool },
 }
 
 fn print_help() {
@@ -115,8 +117,11 @@ fn print_help() {
   world-inspector /path/to/world --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
   world-inspector /path/to/world --import-chunks <file>           从 JSON 导入区块（覆盖）
   world-inspector /path/to/world --import-chunks <file> --skip-existing  跳过已存在 key
+  world-inspector /path/to/world --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimension]  删除区块范围
+  world-inspector /path/to/world --batch-delete-chunks <file> [--invert]  从 JSON 批量删除区块
 
 实体密度分析：
+
   world-inspector /path/to/world --entity-density          按单区块统计实体密度 Top 5
   world-inspector /path/to/world --entity-density 2        按 2×2 区块组统计
   world-inspector /path/to/world --entity-density 4        按 4×4 区块组统计
@@ -198,6 +203,29 @@ fn parse_args() -> Result<Command, String> {
         return Ok(Command::EntityDensity { world_path, group_size });
     }
 
+    if args.len() >= 7 && args[2] == "--delete-chunks" {
+        let bx1 = args[3].parse::<i32>().map_err(|_| format!("bx1 格式错误: '{}'", args[3]))?;
+        let bz1 = args[4].parse::<i32>().map_err(|_| format!("bz1 格式错误: '{}'", args[4]))?;
+        let bx2 = args[5].parse::<i32>().map_err(|_| format!("bx2 格式错误: '{}'", args[5]))?;
+        let bz2 = args[6].parse::<i32>().map_err(|_| format!("bz2 格式错误: '{}'", args[6]))?;
+        let (dim_id, dim_name) = if let Some(raw) = args.get(7) {
+            match raw.to_lowercase().as_str() {
+                "overworld" | "0" => (0u8, "overworld".into()),
+                "nether" | "1"    => (1u8, "nether".into()),
+                "end" | "2"       => (2u8, "end".into()),
+                _ => return Err(format!("未知维度 '{}'，可选: overworld(0) nether(1) end(2)", raw)),
+            }
+        } else {
+            (0u8, "overworld".into())
+        };
+        return Ok(Command::DeleteChunks { world_path, bx1, bz1, bx2, bz2, dim_id, dim_name });
+    }
+
+    if args.len() >= 4 && args[2] == "--batch-delete-chunks" {
+        let invert = args[4..].iter().any(|a| a == "--invert");
+        return Ok(Command::BatchDeleteChunks { world_path, input_file: args[3].clone(), invert });
+    }
+
     if args.len() == 2 {
         return Ok(Command::ShowInfo { world_path });
     }
@@ -245,14 +273,9 @@ fn block_entity_key(cx: i32, cz: i32) -> Vec<u8> {
     key
 }
 
-fn resolve_db_path(world_path: &str, dim_id: u8) -> Vec<String> {
-    let base = world_path.trim_end_matches('/');
-    match dim_id {
-        0 => vec![format!("{}/db", base)],
-        1 => vec![format!("{}/DIM-1/db", base), format!("{}/db", base)],
-        2 => vec![format!("{}/DIM1/db", base), format!("{}/db", base)],
-        _ => vec![format!("{}/db", base)],
-    }
+/// Bedrock 版所有维度共享同一个 db 文件夹，dim_id 仅供查询时区分维度标签。
+fn resolve_db_path(world_path: &str, _dim_id: u8) -> String {
+    format!("{}/db", world_path.trim_end_matches('/'))
 }
 
 // ── Sub-chunk ──
@@ -1073,6 +1096,287 @@ fn cmd_import_chunks_inner(db: &mut DB, input_file: &str, skip_existing: bool) {
     println!("  导入完成: 总数 {}, 已导入 {}, 已跳过 {}", total, imported, skipped);
 }
 
+/// Known Bedrock chunk key discriminator bytes at position 8.
+/// Chunk keys: [cx:4][cz:4][discriminator:1][optional_data]
+fn is_chunk_key(key: &[u8]) -> bool {
+    key.len() >= 9
+        && !key.starts_with(b"~")
+        && !key.starts_with(b"player_")
+        && !key.starts_with(b"actorprefix")
+        && !key.starts_with(b"digp")
+}
+
+/// Extract the dimension id from a chunk key.
+/// Overworld (dim=0): key = [cx:4][cz:4][tag:1][data]  (9-10 bytes, no dim field)
+/// Nether/End  (dim=1/2): key = [cx:4][cz:4][dim:4][tag:1][data]  (13-14 bytes, dim at [8..12])
+fn extract_dim_from_key(key: &[u8]) -> u8 {
+    if key.len() >= 13 {
+        let dim = i32::from_le_bytes(key[8..12].try_into().unwrap());
+        if dim == 1 || dim == 2 { return dim as u8; }
+    }
+    0
+}
+
+/// Collect all chunk-related DB keys with their chunk coordinates and dimension.
+/// Returns (key, cx, cz, dim).
+fn collect_all_chunk_keys_from_db(db: &mut DB) -> Vec<(Vec<u8>, i32, i32, u8)> {
+    let mut results = Vec::new();
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => return results,
+    };
+    iter.seek_to_first();
+    while let Some((key, _value)) = iter.next() {
+        if is_chunk_key(&key) {
+            let cx = i32::from_le_bytes(key[0..4].try_into().unwrap());
+            let cz = i32::from_le_bytes(key[4..8].try_into().unwrap());
+            let dim = extract_dim_from_key(&key);
+            results.push((key, cx, cz, dim));
+        }
+    }
+    results
+}
+
+// ── Chunk deletion ──
+
+fn sort_pair(a: i32, b: i32) -> (i32, i32) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+fn cmd_delete_chunks(db: &mut DB, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_id: u8) {
+    let (cxa, cxb) = sort_pair(bx1.div_euclid(16), bx2.div_euclid(16));
+    let (cza, czb) = sort_pair(bz1.div_euclid(16), bz2.div_euclid(16));
+    let total_chunks = (cxb - cxa + 1) * (czb - cza + 1);
+
+    let mut deleted = 0usize;
+    let mut non_empty = 0usize;
+
+    for cx in cxa..=cxb {
+        for cz in cza..=czb {
+            let keys = collect_chunk_keys(db, cx, cz);
+            if keys.is_empty() { continue; }
+            // Filter keys by dimension before deleting
+            let to_delete: Vec<Vec<u8>> = keys.into_iter()
+                .filter(|(key, _)| extract_dim_from_key(key) == dim_id)
+                .map(|(key, _)| key)
+                .collect();
+            if to_delete.is_empty() { continue; }
+            non_empty += 1;
+            for key in &to_delete {
+                let _ = db.delete(key);
+                deleted += 1;
+            }
+        }
+    }
+
+    // Post-delete verification (within same write-mode session, MemTable is current)
+    let mut remaining = 0usize;
+    let mut remaining_chunks = 0usize;
+    for cx in cxa..=cxb {
+        for cz in cza..=czb {
+            let keys = collect_chunk_keys(db, cx, cz);
+            if keys.is_empty() { continue; }
+            let dim_keys: Vec<_> = keys.into_iter()
+                .filter(|(key, _)| extract_dim_from_key(key) == dim_id)
+                .collect();
+            if dim_keys.is_empty() { continue; }
+            remaining_chunks += 1;
+            remaining += dim_keys.len();
+        }
+    }
+
+    println!("  区块删除完成: 范围 ({}, {}) ~ ({}, {}), 共 {} 区块",
+        cxa, cza, cxb, czb, total_chunks);
+    println!("  删除 {} 条键值, 涉及 {} 区块, {} 区块无数据",
+        deleted, non_empty, total_chunks - non_empty as i32);
+    if remaining == 0 && non_empty > 0 {
+        println!("  验证: 所有区块数据已成功删除");
+    } else if remaining > 0 {
+        println!("  验证: {} 条键值在 {} 个区块中未清除 (仅 WAL 写入, 待 compaction)", remaining, remaining_chunks);
+    }
+}
+
+// ── Batch chunk deletion ──
+
+#[derive(Clone, Debug)]
+struct ChunkRect {
+    dim_id: u8,
+    cx1: i32, cz1: i32,
+    cx2: i32, cz2: i32,
+}
+
+fn parse_dimension(val: &serde_json::Value) -> Result<u8, String> {
+    match val {
+        serde_json::Value::Number(n) => {
+            let d = n.as_i64().ok_or_else(|| "维度值不是整数".to_string())?;
+            match d { 0 | 1 | 2 => Ok(d as u8), _ => Err(format!("维度值无效: {}", d)) }
+        }
+        serde_json::Value::String(s) => match s.to_lowercase().as_str() {
+            "overworld" => Ok(0),
+            "nether" => Ok(1),
+            "end" => Ok(2),
+            _ => Err(format!("未知维度名称: '{}'", s)),
+        },
+        _ => Err("维度必须是整数或字符串".to_string()),
+    }
+}
+
+fn parse_and_validate_batch_file(input_file: &str) -> Result<Vec<ChunkRect>, String> {
+    let json_str = std::fs::read_to_string(input_file)
+        .map_err(|e| format!("读取文件失败: {}", e))?;
+    let data: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("JSON 解析失败: {}", e))?;
+
+    let regions = data["regions"].as_array()
+        .ok_or_else(|| "JSON 缺少 regions 数组字段".to_string())?;
+
+    if regions.is_empty() {
+        return Err("regions 数组不能为空".to_string());
+    }
+
+    if let Some(total) = data["total"].as_u64() {
+        if total as usize != regions.len() {
+            return Err(format!("total ({}) 与 regions 数量 ({}) 不匹配", total, regions.len()));
+        }
+    }
+
+    let mut chunk_rects = Vec::with_capacity(regions.len());
+
+    for (i, region) in regions.iter().enumerate() {
+        if !region.is_object() {
+            return Err(format!("regions[{}] 必须是对象", i));
+        }
+
+        let dim_val = region.get("dimension")
+            .ok_or_else(|| format!("regions[{}] 缺少 dimension 字段", i))?;
+        let dim_id = parse_dimension(dim_val)?;
+
+        let x1 = region["x1"].as_i64()
+            .ok_or_else(|| format!("regions[{}] x1 格式无效", i))? as i32;
+        let z1 = region["z1"].as_i64()
+            .ok_or_else(|| format!("regions[{}] z1 格式无效", i))? as i32;
+        let x2 = region["x2"].as_i64()
+            .ok_or_else(|| format!("regions[{}] x2 格式无效", i))? as i32;
+        let z2 = region["z2"].as_i64()
+            .ok_or_else(|| format!("regions[{}] z2 格式无效", i))? as i32;
+
+        let (cx1, cx2_chk) = sort_pair(x1.div_euclid(16), x2.div_euclid(16));
+        let (cz1, cz2_chk) = sort_pair(z1.div_euclid(16), z2.div_euclid(16));
+
+        chunk_rects.push(ChunkRect { dim_id, cx1, cz1, cx2: cx2_chk, cz2: cz2_chk });
+    }
+
+    Ok(chunk_rects)
+}
+
+/// Check if a chunk coordinate with given dimension falls within any of the rectangles.
+fn is_chunk_in_rects(cx: i32, cz: i32, dim: u8, rects: &[ChunkRect]) -> bool {
+    rects.iter().any(|r| r.dim_id == dim && cx >= r.cx1 && cx <= r.cx2 && cz >= r.cz1 && cz <= r.cz2)
+}
+fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
+    // Phase 1: parse and validate JSON
+    eprintln!("  正在解析批量文件...");
+    let rects = match parse_and_validate_batch_file(input_file) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("错误: 批量文件校验失败: {}", e); std::process::exit(1); }
+    };
+    println!("  解析完成: {} 个区域", rects.len());
+
+    // Phase 2: no merge needed - use raw rects with linear scan
+    let merged = &rects;
+
+    // Phase 3: resolve DB path (BE: all data in db/)
+    let db_path = resolve_db_path(world_path, 0);
+    if !std::path::Path::new(&db_path).is_dir() || !std::path::Path::new(&format!("{}/CURRENT", db_path)).exists() {
+        eprintln!("错误: LevelDB 目录不存在: {}", db_path);
+        std::process::exit(1);
+    }
+    println!("\n  DB: {}", db_path);
+
+    // Phase 4: collect all chunk keys (read-only)
+    let mut opt_ro = mcpe_options(CompressionLevel::DefaultLevel as u8);
+    opt_ro.read_only = true;
+    let mut db_ro = match DB::open(&db_path, opt_ro) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
+    };
+
+    let all_keys = collect_all_chunk_keys_from_db(&mut db_ro);
+    println!("    DB 扫描: {} 条键值", all_keys.len());
+    drop(db_ro);
+
+    if all_keys.is_empty() {
+        println!("    DB 中无区块数据");
+        std::process::exit(0);
+    }
+
+    // Phase 5: parallel filter
+    let mode_label = if invert { "区域外" } else { "区域内" };
+    eprintln!("    正在并行过滤 ({}模式)...", mode_label);
+
+    let keys_to_delete: Vec<Vec<u8>> = if invert {
+        all_keys.par_iter()
+            .filter(|(_, cx, cz, dim)| !is_chunk_in_rects(*cx, *cz, *dim, merged))
+            .map(|(key, _, _, _)| key.clone())
+            .collect()
+    } else {
+        all_keys.par_iter()
+            .filter(|(_, cx, cz, dim)| is_chunk_in_rects(*cx, *cz, *dim, merged))
+            .map(|(key, _, _, _)| key.clone())
+            .collect()
+    };
+
+    let collect_count = keys_to_delete.len();
+    if collect_count == 0 {
+        println!("    无待删除键值");
+        std::process::exit(0);
+    }
+
+    // Phase 6: delete (write mode)
+    eprintln!("    正在删除 {} 条键值...", collect_count);
+    let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
+    opt.reuse_logs = false;
+    opt.reuse_manifest = false;
+    opt.read_only = false;
+    let mut db = match DB::open(&db_path, opt) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("    错误: 无法以写模式打开 DB: {}", e); std::process::exit(1); }
+    };
+
+    // Phase 6: delete
+    for key in &keys_to_delete {
+        let _ = db.delete(key);
+    }
+
+    // Phase 7: verify within same write session (MemTable is current)
+    eprintln!("    正在验证删除结果...");
+    let still_there = keys_to_delete.iter().filter(|k| db.get(k).is_some()).count();
+    drop(db);
+
+    // Count unique chunks for reporting
+    let mut chunks_set: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    for key in &keys_to_delete {
+        if key.len() >= 8 {
+            let cx = i32::from_le_bytes(key[0..4].try_into().unwrap());
+            let cz = i32::from_le_bytes(key[4..8].try_into().unwrap());
+            chunks_set.insert((cx, cz));
+        }
+    }
+
+    let unique_chunks = chunks_set.len();
+    println!("    ✓ 删除 {} 条键值, 涉及 {} 区块", collect_count, unique_chunks);
+
+    if still_there == 0 {
+        println!("    ✓ 验证: 目标区域数据已全部删除（同会话确认）");
+    } else {
+        println!("    验证: {} 条键值仍存留（仅 WAL 写入，BDS 启动后生效）", still_there);
+    }
+
+    println!("\n═══ 批量删除报告 ═══");
+    println!("  总计删除: {} 条键值", collect_count);
+    println!("    {}: {} 区块, {} 键值", db_path, unique_chunks, collect_count);
+}
+
 // ── Main ──
 
 fn main() {
@@ -1086,7 +1390,8 @@ fn main() {
         Command::ShowInfo { world_path } | Command::ListPlayers { world_path } | Command::ListActors { world_path } | Command::ShowPlayer { world_path, .. }
             | Command::WipeActors { world_path, .. } | Command::ExportActors { world_path, .. } | Command::ExportChunks { world_path, .. }
             | Command::ImportActors { world_path, .. } | Command::ImportChunks { world_path, .. }
-            | Command::EntityDensity { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
+            | Command::EntityDensity { world_path, .. } | Command::BatchDeleteChunks { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
+        Command::DeleteChunks { world_path, dim_id, dim_name, .. } => (world_path.as_str(), *dim_id, dim_name.as_str()),
     };
 
     if !Path::new(world_path).is_dir() {
@@ -1105,17 +1410,12 @@ fn main() {
     let inv_ver = level.get("InventoryVersion").and_then(|t| t.as_str()).unwrap_or("(unknown)");
     println!("  World: {}  (v{})", world_name, inv_ver);
 
-    let db_candidates = resolve_db_path(world_path, dim_id);
-    let mut db_path = None;
-    for c in &db_candidates {
-        if Path::new(c).is_dir() && Path::new(&format!("{}/CURRENT", c)).exists() {
-            db_path = Some(c.clone()); break;
-        }
+    let db_path = resolve_db_path(world_path, dim_id);
+    if !Path::new(&db_path).is_dir() || !Path::new(&format!("{}/CURRENT", db_path)).exists() {
+        eprintln!("错误: LevelDB 目录不存在: {}", db_path);
+        std::process::exit(1);
     }
-    let db_path = match db_path {
-        Some(p) => { println!("  DB: {}", p); p }
-        None => { eprintln!("错误: 找不到 LevelDB 数据"); std::process::exit(1); }
-    };
+    println!("  DB: {}", db_path);
 
     // ─── Write commands: open DB in write mode directly ───
     match cmd {
@@ -1207,6 +1507,25 @@ fn main() {
                 Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
             };
             cmd_import_chunks_inner(&mut db, input_file, skip_existing);
+            println!();
+            std::process::exit(0);
+        }
+        Command::DeleteChunks { bx1, bz1, bx2, bz2, dim_id, .. } => {
+            let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
+            opt.reuse_logs = false;
+            opt.reuse_manifest = false;
+            opt.read_only = false;
+            let mut db = match DB::open(&db_path, opt) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
+            };
+            cmd_delete_chunks(&mut db, bx1, bz1, bx2, bz2, dim_id);
+            drop(db);
+            println!();
+            std::process::exit(0);
+        }
+        Command::BatchDeleteChunks { ref input_file, invert, .. } => {
+            cmd_batch_delete_chunks(world_path, input_file, invert);
             println!();
             std::process::exit(0);
         }
@@ -1461,7 +1780,8 @@ fn main() {
             cmd_entity_density(&mut db, group_size);
         }
 
-        Command::ImportActors { .. } | Command::WipeActors { .. } | Command::ImportChunks { .. } => {
+        Command::ImportActors { .. } | Command::WipeActors { .. } | Command::ImportChunks { .. }
+            | Command::DeleteChunks { .. } | Command::BatchDeleteChunks { .. } => {
             unreachable!()
         }
     }

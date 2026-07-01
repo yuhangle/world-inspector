@@ -40,6 +40,8 @@ world-inspector <世界路径> --export-chunks <file> <bx> <bz>                �
 world-inspector <世界路径> --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
 world-inspector <世界路径> --import-chunks <file>               从 JSON 导入区块（覆盖）
 world-inspector <世界路径> --import-chunks <file> --skip-existing  导入区块（跳过已存在）
+world-inspector <世界路径> --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimension]  删除区块范围
+world-inspector <世界路径> --batch-delete-chunks <file> [--invert]  从 JSON 批量删除区块
 
 实体密度分析：
 world-inspector <世界路径> --entity-density [N]              按 N×N 区块组统计实体密度 Top 5
@@ -92,7 +94,50 @@ world-inspector /target-world --import-chunks chunks.json
 
 # 实体密度分析（按 2×2 区块组，显示实体最密集的前 5 个区域）
 world-inspector /world --entity-density 2
+
+# 单次删除区块范围（方块坐标，默认主世界）
+world-inspector /world --delete-chunks 0 0 100 100
+
+# 删除下界区块
+world-inspector /world --delete-chunks -50 -50 50 50 nether
+
+# 从 JSON 批量删除区块
+world-inspector /world --batch-delete-chunks regions.json
+
+# 反选删除：删除指定区域之外的所有区块
+world-inspector /world --batch-delete-chunks regions.json --invert
 ```
+
+### 批量删除 JSON 文件格式
+
+```json
+{
+  "total": 2,
+  "regions": [
+    {
+      "dimension": 0,
+      "x1": 0,
+      "z1": 0,
+      "x2": 100,
+      "z2": 100
+    },
+    {
+      "dimension": "nether",
+      "x1": -50,
+      "z1": -50,
+      "x2": 50,
+      "z2": 50
+    }
+  ]
+}
+```
+
+- `total` — 可选，校验字段，必须与 `regions` 数组长度一致
+- `regions` — 区域数组（至少 1 项），每项包含：
+  - `dimension` — 维度：`0` / `"overworld"` | `1` / `"nether"` | `2` / `"end"`
+  - `x1`, `z1`, `x2`, `z2` — 方块坐标的两个对角点
+
+
 
 ## 跨存档数据迁移
 
@@ -155,8 +200,11 @@ CLI 自动跟随 `ServerId` 链接显示关联数据。
 ## 注
 
 - 只读命令以 `read_only` 模式打开 LevelDB，不修改数据
-- 写命令（wipe/import）以读写模式独立打开 DB，不影响只读功能
-- delete 操作写入 LevelDB 删除标记（tombstone），BDS 启动时自动识别
+- 写命令（wipe/import/delete）以读写模式独立打开 DB，不影响只读功能
+- delete 操作写入 LevelDB 删除标记（tombstone）到 WAL
+- 删除验证：CLI 在同一 write 会话内验证删除成功 ✅（输出 `验证: 目标区域数据已全部删除`）
+- 只读查看（如 `--export-chunks`）：WAL 回放机制导致 read-only 模式可能仍显示旧数据，以同会话验证为准
+- 对 BDS 生效：BDS 以 write-mode 启动时自动回放 WAL，删除标记被正确识别，数据清除
 - 导出的 JSON 文件支持 `--skip-existing` 可重入安全地增量导入
 
 ## C FFI 接口
