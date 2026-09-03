@@ -496,19 +496,33 @@ fn read_level_dat(path: &str) -> Result<CompoundTag, String> {
 
 // ── Player scanning ──
 
-/// 前缀扫描统一使用 seek_to_first + 分类。
-/// 注意: fork 的 leveldb seek 存在索引定位缺陷（对部分 ASCII 前缀会跳过头），
-/// 全量扫描可避免。DB 键量级 ~10 万，扫描成本可接受。
-fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut results = Vec::new();
+/// 收集以 prefix 开头的连续键。注意: LdbIterator::next() 会先 advance 再返回,
+/// seek 命中的首个键必须经 current() 取出, 否则会漏掉第一个匹配键。
+fn collect_prefix(db: &mut DB, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
     let mut iter = match db.new_iter() {
         Ok(it) => it,
-        Err(_) => return results,
+        Err(_) => return out,
     };
-    iter.seek_to_first();
+    iter.seek(prefix);
+    if let Some((key, value)) = iter.current() {
+        if key.starts_with(prefix) {
+            out.push((key.to_vec(), value.to_vec()));
+        }
+    }
     while let Some((key, value)) = iter.next() {
-        if key.starts_with(b"~local_player") || key.starts_with(b"~player_")
-            || (key.starts_with(b"player_") && !key.starts_with(b"player_server_")) {
+        if !key.starts_with(prefix) { break; }
+        out.push((key, value));
+    }
+    out
+}
+
+/// 前缀扫描依赖 fork 的 seek 修复(leveldb-rs 9326330); 若回退旧版依赖需改回全量扫描。
+fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut results = Vec::new();
+    for prefix in [b"~local_player".as_slice(), b"~player_", b"player_"] {
+        for (key, value) in collect_prefix(db, prefix) {
+            if prefix == b"player_" && key.starts_with(b"player_server_") { continue; }
             results.push((key, value));
         }
     }
@@ -517,32 +531,12 @@ fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 fn scan_all_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut results = scan_player_keys(db);
-    let mut iter = match db.new_iter() {
-        Ok(it) => it,
-        Err(_) => return results,
-    };
-    iter.seek_to_first();
-    while let Some((key, value)) = iter.next() {
-        if key.starts_with(b"player_server_") {
-            results.push((key, value));
-        }
-    }
+    results.extend(collect_prefix(db, b"player_server_"));
     results
 }
 
 fn scan_actor_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut results = Vec::new();
-    let mut iter = match db.new_iter() {
-        Ok(it) => it,
-        Err(_) => return results,
-    };
-    iter.seek_to_first();
-    while let Some((key, value)) = iter.next() {
-        if key.starts_with(b"actorprefix") {
-            results.push((key, value));
-        }
-    }
-    results
+    collect_prefix(db, b"actorprefix")
 }
 
 fn fmt_pos(tag: &Tag) -> String {
@@ -797,58 +791,57 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn cmd_export_actors(db: &mut DB, output_file: &str, no_players: bool) {
-    // Collect entity-related keys:
+    // Collect entity-related keys by prefix seek (fork seek fixed at leveldb-rs 9326330):
     //   actorprefix*  — entity NBT data
     //   digp*         — entity digest / chunk linkage
     //   player_*, ~*  — player data (omitted if no_players)
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
 
-    let mut iter = match db.new_iter() {
-        Ok(it) => it,
-        Err(_) => { eprintln!("错误: 无法创建 DB 迭代器"); std::process::exit(1); }
-    };
-    iter.seek_to_first();
-    while let Some((key, value)) = iter.next() {
-        let is_actorprefix = key.starts_with(b"actorprefix");
-        let is_digp = key.starts_with(b"digp");
-        let is_player_data = key.starts_with(b"player_") || key.starts_with(b"~");
+    // 1) actorprefix
+    for (key, value) in collect_prefix(db, b"actorprefix") {
+        // Determine if this actor is a player
+        let is_player_actor = CompoundTag::from_binary_nbt(&value, true).ok()
+            .map(|(tag, _)| tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string())))
+            .flatten()
+            .as_deref()
+            == Some("minecraft:player");
 
-        if is_actorprefix {
-            // Determine if this actor is a player
-            let is_player_actor = CompoundTag::from_binary_nbt(&value, true).ok()
-                .map(|(tag, _)| tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string())))
-                .flatten()
-                .as_deref()
-                == Some("minecraft:player");
+        // Skip player actors when --no-players
+        if no_players && is_player_actor {
+            continue;
+        }
 
-            // Skip player actors when --no-players
-            if no_players && is_player_actor {
-                continue;
+        *counts.entry("actors").or_insert(0) += 1;
+        let identifier = if is_player_actor { Some("minecraft:player".to_string()) } else {
+            CompoundTag::from_binary_nbt(&value, true).ok().and_then(|(tag, _)| {
+                tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string()))
+                    .or_else(|| tag.get("id").and_then(|t| t.as_str().map(|s| s.to_string())))
+            })
+        };
+        entries.push(serde_json::json!({
+            "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
+            "identifier": identifier,
+        }));
+    }
+
+    // 2) digp
+    for (key, value) in collect_prefix(db, b"digp") {
+        *counts.entry("digp").or_insert(0) += 1;
+        entries.push(serde_json::json!({
+            "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
+        }));
+    }
+
+    // 3) player data
+    if !no_players {
+        for prefix in [b"~local_player".as_slice(), b"~player_", b"player_"] {
+            for (key, value) in collect_prefix(db, prefix) {
+                *counts.entry("players").or_insert(0) += 1;
+                entries.push(serde_json::json!({
+                    "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
+                }));
             }
-
-            counts.entry("actors").or_insert(0);
-            *counts.get_mut("actors").unwrap() += 1;
-            let identifier = if is_player_actor { Some("minecraft:player".to_string()) } else {
-                CompoundTag::from_binary_nbt(&value, true).ok().and_then(|(tag, _)| {
-                    tag.get("identifier").and_then(|t| t.as_str().map(|s| s.to_string()))
-                        .or_else(|| tag.get("id").and_then(|t| t.as_str().map(|s| s.to_string())))
-                })
-            };
-            entries.push(serde_json::json!({
-                "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
-                "identifier": identifier,
-            }));
-        } else if is_digp {
-            *counts.entry("digp").or_insert(0) += 1;
-            entries.push(serde_json::json!({
-                "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
-            }));
-        } else if is_player_data && !no_players {
-            *counts.entry("players").or_insert(0) += 1;
-            entries.push(serde_json::json!({
-                "key_hex": hex_encode(&key), "value_base64": general_purpose::STANDARD.encode(&value),
-            }));
         }
     }
 
@@ -1040,6 +1033,16 @@ fn collect_chunk_keys(db: &mut DB, cx: i32, cz: i32) -> Vec<(Vec<u8>, Vec<u8>)> 
     seek_key.extend_from_slice(&cx.to_le_bytes());
     seek_key.extend_from_slice(&cz.to_le_bytes());
     iter.seek(&seek_key);
+    // next() 会先 advance, 先取出 seek 命中的首键
+    if let Some((key, value)) = iter.current() {
+        if key.len() >= 8 {
+            let kcx = i32::from_le_bytes(key[0..4].try_into().unwrap());
+            let kcz = i32::from_le_bytes(key[4..8].try_into().unwrap());
+            if kcx == cx && kcz == cz {
+                results.push((key.to_vec(), value.to_vec()));
+            }
+        }
+    }
     while let Some((key, value)) = iter.next() {
         if key.len() < 8 { continue; }
         let kcx = i32::from_le_bytes(key[0..4].try_into().unwrap());
@@ -1089,30 +1092,34 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
         }
     }
 
-    // ── Phase 2+3 (单次全扫): digp + actorprefix 收集 ──
-    // 注: fork 的 leveldb seek 存在缺陷(manifest last_seq 偏小时, seek 会定位到 seq 超快照的
-    // 隐藏版本而被过滤跳过, 导致部分前缀的键"找不到"), 全量扫描可避免。
-    // digp 键先收集(建立存储键链接集), actorprefix 键暂存, 扫描结束后按链接集筛选。
+    // ── Phase 2: 按矩形逐区块前缀收集 digp（依赖 fork 的 seek 修复, leveldb-rs 9326330） ──
     let mut actor_keys: std::collections::HashSet<[u8; 8]> = std::collections::HashSet::new();
-    let mut has_digp_world = false;
-    let mut actors_pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut iter = match db.new_iter() {
-        Ok(it) => it,
-        Err(_) => { eprintln!("错误: 无法创建 DB 迭代器"); std::process::exit(1); }
+
+    // 探测存档是否使用 digp（现代存储）: 只定位首个 digp 键
+    let has_digp_world = {
+        let mut probe = match db.new_iter() {
+            Ok(it) => it,
+            Err(_) => { eprintln!("错误: 无法创建 DB 迭代器"); std::process::exit(1); }
+        };
+        probe.seek(b"digp");
+        probe.valid()
+            && probe.current().map(|(k, _)| k.starts_with(b"digp")).unwrap_or(false)
     };
-    iter.seek_to_first();
-    while let Some((key, value)) = iter.next() {
-        if key.starts_with(b"digp") {
-            has_digp_world = true;
-            let (cx, cz, dim) = match key.len() {
-                12 => (i32::from_le_bytes(key[4..8].try_into().unwrap()),
-                       i32::from_le_bytes(key[8..12].try_into().unwrap()), 0u8),
-                16 => (i32::from_le_bytes(key[4..8].try_into().unwrap()),
-                       i32::from_le_bytes(key[8..12].try_into().unwrap()),
-                       i32::from_le_bytes(key[12..16].try_into().unwrap()) as u8),
-                _ => continue,
-            };
-            if cx >= cxa && cx <= cxb && cz >= cza && cz <= czb && dim_filter.map_or(true, |f| dim == f) {
+
+    for cx in cxa..=cxb {
+        for cz in cza..=czb {
+            let mut prefix = Vec::with_capacity(12);
+            prefix.extend_from_slice(b"digp");
+            prefix.extend_from_slice(&cx.to_le_bytes());
+            prefix.extend_from_slice(&cz.to_le_bytes());
+            for (key, value) in collect_prefix(db, &prefix) {
+                // 12 字节: 主世界无维度字段; 16 字节: bytes[12..16] 为维度 LE i32
+                let dim = match key.len() {
+                    12 => 0u8,
+                    16 => i32::from_le_bytes(key[12..16].try_into().unwrap()) as u8,
+                    _ => continue,
+                };
+                if !dim_filter.map_or(true, |f| dim == f) { continue; }
                 *counts.entry("digp").or_insert(0) += 1;
                 for chunk in value.chunks_exact(8) {
                     if let Ok(k) = chunk.try_into() { actor_keys.insert(k); }
@@ -1122,20 +1129,26 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
                     "value_base64": general_purpose::STANDARD.encode(&value),
                 }));
             }
-        } else if key.starts_with(b"actorprefix") {
-            if key.len() == 19 {
-                actors_pending.push((key, value));
-            }
         }
     }
 
-    // actorprefix 筛选: 现代存储按 digp 链接(维度权威); 旧版无 digp 按 Pos 兜底
-    for (key, value) in &actors_pending {
-        let storage_key: [u8; 8] = key[11..19].try_into().unwrap();
-        let linked = if has_digp_world {
-            actor_keys.contains(&storage_key)
-        } else {
-            CompoundTag::from_binary_nbt(value, true).ok().map(|(tag, _)| {
+    // ── Phase 3: actorprefix 收集 ──
+    // 现代存储: digp 链接集精确直读(无需全扫); 旧版无 digp 世界: 按 Pos 全量兜底
+    if has_digp_world {
+        for storage in &actor_keys {
+            let key = build_actorprefix_key(*storage);
+            if let Some(value) = db.get(&key) {
+                *counts.entry("actors").or_insert(0) += 1;
+                entries.push(serde_json::json!({
+                    "key_hex": hex_encode(&key),
+                    "value_base64": general_purpose::STANDARD.encode(&value),
+                }));
+            }
+        }
+    } else {
+        for (key, value) in collect_prefix(db, b"actorprefix") {
+            if key.len() != 19 { continue; }
+            let linked = CompoundTag::from_binary_nbt(&value, true).ok().map(|(tag, _)| {
                 if tag.get("identifier").and_then(|t| t.as_str()) == Some("minecraft:player") { return false; }
                 match tag.get("Pos") {
                     Some(Tag::List(lv)) if lv.elements.len() >= 3 => {
@@ -1148,14 +1161,14 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
                     }
                     _ => false,
                 }
-            }).unwrap_or(false)
-        };
-        if linked {
-            *counts.entry("actors").or_insert(0) += 1;
-            entries.push(serde_json::json!({
-                "key_hex": hex_encode(key),
-                "value_base64": general_purpose::STANDARD.encode(value),
-            }));
+            }).unwrap_or(false);
+            if linked {
+                *counts.entry("actors").or_insert(0) += 1;
+                entries.push(serde_json::json!({
+                    "key_hex": hex_encode(&key),
+                    "value_base64": general_purpose::STANDARD.encode(&value),
+                }));
+            }
         }
     }
 
@@ -2113,7 +2126,7 @@ fn main() {
             }
 
             if include_players {
-                // Collect player_*, ~* keys (全量扫描, 规避 fork seek 缺陷)
+                // Collect player_*, ~*, player_server_* keys (前缀扫描)
                 for (key, _) in scan_all_player_keys(&mut db_ro) {
                     to_delete.push(key);
                 }

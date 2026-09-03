@@ -207,18 +207,33 @@ fn tag_to_i32(tag: &Tag) -> Option<i32> {
     match tag { Tag::Byte(v) => Some(*v as i32), Tag::Short(v) => Some(*v as i32), Tag::Int(v) => Some(*v), Tag::Long(v) => Some(*v as i32), _ => None }
 }
 
-// 前缀扫描统一用 seek_to_first + 分类（fork 的 leveldb seek 对部分前缀有索引定位缺陷）。
-
-fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut results = Vec::new();
+// 收集以 prefix 开头的连续键。注意: LdbIterator::next() 会先 advance 再返回,
+// seek 命中的首个键必须经 current() 取出, 否则会漏掉第一个匹配键。
+fn collect_prefix(db: &mut DB, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
     let mut iter = match db.new_iter() {
         Ok(it) => it,
-        Err(_) => return results,
+        Err(_) => return out,
     };
-    iter.seek_to_first();
+    iter.seek(prefix);
+    if let Some((key, value)) = iter.current() {
+        if key.starts_with(prefix) {
+            out.push((key.to_vec(), value.to_vec()));
+        }
+    }
     while let Some((key, value)) = iter.next() {
-        if key.starts_with(b"~local_player") || key.starts_with(b"~player_")
-            || (key.starts_with(b"player_") && !key.starts_with(b"player_server_")) {
+        if !key.starts_with(prefix) { break; }
+        out.push((key, value));
+    }
+    out
+}
+
+// 前缀扫描依赖 fork 的 seek 修复(leveldb-rs 9326330); 若回退到旧版依赖需改回全量扫描。
+fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut results = Vec::new();
+    for prefix in [b"~local_player".as_slice(), b"~player_", b"player_"] {
+        for (key, value) in collect_prefix(db, prefix) {
+            if prefix == b"player_" && key.starts_with(b"player_server_") { continue; }
             results.push((key, value));
         }
     }
@@ -227,16 +242,7 @@ fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 fn scan_all_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut results = scan_player_keys(db);
-    let mut iter = match db.new_iter() {
-        Ok(it) => it,
-        Err(_) => return results,
-    };
-    iter.seek_to_first();
-    while let Some((key, value)) = iter.next() {
-        if key.starts_with(b"player_server_") {
-            results.push((key, value));
-        }
-    }
+    results.extend(collect_prefix(db, b"player_server_"));
     results
 }
 
