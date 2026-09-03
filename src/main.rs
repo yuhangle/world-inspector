@@ -63,9 +63,9 @@ enum Command {
     ShowPlayer { world_path: String, player_key: String, dump: bool, json: bool },
     WipeActors { world_path: String, include_players: bool },
     ExportActors { world_path: String, output_file: String, no_players: bool },
-    ExportChunks { world_path: String, output_file: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32 },
+    ExportChunks { world_path: String, output_file: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim: Option<u8> },
     ImportActors { world_path: String, input_file: String, skip_existing: bool },
-    ImportChunks { world_path: String, input_file: String, skip_existing: bool },
+    ImportChunks { world_path: String, input_file: String, skip_existing: bool, to: Option<(i32, i32)>, dim_override: Option<u8>, dry_run: bool },
     EntityDensity { world_path: String, group_size: u32 },
     DeleteChunks { world_path: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_id: u8, dim_name: String },
     BatchDeleteChunks { world_path: String, input_file: String, invert: bool },
@@ -113,10 +113,11 @@ fn print_help() {
   world-inspector /path/to/world --import-actors <file> --skip-existing  跳过已存在实体
 
 区块管理：
-  world-inspector /path/to/world --export-chunks <file> <bx> <bz>            导出单区块(方块坐标)
-  world-inspector /path/to/world --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
+  world-inspector /path/to/world --export-chunks <file> <bx> <bz> [dimension]            导出单区块(方块坐标)
+  world-inspector /path/to/world --export-chunks <file> <bx1> <bz1> <bx2> <bz2> [dimension]  导出区块范围
   world-inspector /path/to/world --import-chunks <file>           从 JSON 导入区块（覆盖）
   world-inspector /path/to/world --import-chunks <file> --skip-existing  跳过已存在 key
+  world-inspector /path/to/world --import-chunks <file> --to <bx> <bz> [--dimension <dim>] [--dry-run]  定点平移导入(复制到新位置)
   world-inspector /path/to/world --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimension]  删除区块范围
   world-inspector /path/to/world --batch-delete-chunks <file> [--invert]  从 JSON 批量删除区块
 
@@ -126,6 +127,16 @@ fn print_help() {
   world-inspector /path/to/world --entity-density 2        按 2×2 区块组统计
   world-inspector /path/to/world --entity-density 4        按 4×4 区块组统计
 ");
+}
+
+/// Parse a dimension argument: "overworld"/"0", "nether"/"1", "end"/"2".
+fn parse_dimension_arg(raw: &str) -> Result<u8, String> {
+    match raw.to_lowercase().as_str() {
+        "overworld" | "0" => Ok(0u8),
+        "nether" | "1"    => Ok(1u8),
+        "end" | "2"       => Ok(2u8),
+        _ => Err(format!("未知维度 '{}'，可选: overworld(0) nether(1) end(2)", raw)),
+    }
 }
 
 fn parse_args() -> Result<Command, String> {
@@ -171,24 +182,59 @@ fn parse_args() -> Result<Command, String> {
     if args.len() >= 4 && args[2] == "--export-chunks" {
         let file = args[3].clone();
         let extra: Vec<&String> = args[4..].iter().collect();
-        if extra.len() == 2 {
-            let bx = extra[0].parse::<i32>().map_err(|_| format!("bx 格式错误: '{}'", extra[0]))?;
-            let bz = extra[1].parse::<i32>().map_err(|_| format!("bz 格式错误: '{}'", extra[1]))?;
-            return Ok(Command::ExportChunks { world_path, output_file: file, bx1: bx, bz1: bz, bx2: bx, bz2: bz });
-        } else if extra.len() == 4 {
-            let bx1 = extra[0].parse::<i32>().map_err(|_| format!("bx1 格式错误: '{}'", extra[0]))?;
-            let bz1 = extra[1].parse::<i32>().map_err(|_| format!("bz1 格式错误: '{}'", extra[1]))?;
-            let bx2 = extra[2].parse::<i32>().map_err(|_| format!("bx2 格式错误: '{}'", extra[2]))?;
-            let bz2 = extra[3].parse::<i32>().map_err(|_| format!("bz2 格式错误: '{}'", extra[3]))?;
-            return Ok(Command::ExportChunks { world_path, output_file: file, bx1, bz1, bx2, bz2 });
-        } else {
-            return Err("区块导出需要 2 个坐标(单区块) 或 4 个坐标(范围)".into());
+        // Optional trailing dimension token (non-numeric, e.g. "nether")
+        let (mut dim, mut coords): (Option<u8>, Vec<&String>) = (None, Vec::new());
+        for tok in &extra {
+            if tok.parse::<i32>().is_ok() {
+                coords.push(tok);
+            } else if dim.is_none() {
+                dim = Some(parse_dimension_arg(tok)?);
+            } else {
+                return Err(format!("参数 '{}' 无法解析", tok));
+            }
+        }
+        match coords.len() {
+            2 => {
+                let bx = coords[0].parse::<i32>().map_err(|_| format!("bx 格式错误: '{}'", coords[0]))?;
+                let bz = coords[1].parse::<i32>().map_err(|_| format!("bz 格式错误: '{}'", coords[1]))?;
+                return Ok(Command::ExportChunks { world_path, output_file: file, bx1: bx, bz1: bz, bx2: bx, bz2: bz, dim });
+            }
+            4 => {
+                let bx1 = coords[0].parse::<i32>().map_err(|_| format!("bx1 格式错误: '{}'", coords[0]))?;
+                let bz1 = coords[1].parse::<i32>().map_err(|_| format!("bz1 格式错误: '{}'", coords[1]))?;
+                let bx2 = coords[2].parse::<i32>().map_err(|_| format!("bx2 格式错误: '{}'", coords[2]))?;
+                let bz2 = coords[3].parse::<i32>().map_err(|_| format!("bz2 格式错误: '{}'", coords[3]))?;
+                return Ok(Command::ExportChunks { world_path, output_file: file, bx1, bz1, bx2, bz2, dim });
+            }
+            _ => return Err("区块导出需要 2 个坐标(单区块) 或 4 个坐标(范围)，维度可选".into()),
         }
     }
 
     if args.len() >= 4 && args[2] == "--import-chunks" {
-        let skip_existing = args[4..].iter().any(|a| a == "--skip-existing");
-        return Ok(Command::ImportChunks { world_path, input_file: args[3].clone(), skip_existing });
+        let mut skip_existing = false;
+        let mut dry_run = false;
+        let mut to: Option<(i32, i32)> = None;
+        let mut dim_override: Option<u8> = None;
+        let mut rest = args[4..].iter();
+        while let Some(arg) = rest.next() {
+            match arg.as_str() {
+                "--skip-existing" => skip_existing = true,
+                "--dry-run" => dry_run = true,
+                "--to" => {
+                    let bx = rest.next().ok_or("--to 需要 <bx> <bz>")?
+                        .parse::<i32>().map_err(|_| "--to bx 格式错误".to_string())?;
+                    let bz = rest.next().ok_or("--to 需要 <bx> <bz>")?
+                        .parse::<i32>().map_err(|_| "--to bz 格式错误".to_string())?;
+                    to = Some((bx, bz));
+                }
+                "--dimension" => {
+                    let raw = rest.next().ok_or("--dimension 需要维度名".to_string())?;
+                    dim_override = Some(parse_dimension_arg(raw)?);
+                }
+                _ => return Err(format!("未知参数 '{}'", arg)),
+            }
+        }
+        return Ok(Command::ImportChunks { world_path, input_file: args[3].clone(), skip_existing, to, dim_override, dry_run });
     }
 
     if args.len() >= 3 && args[2] == "--entity-density" {
@@ -209,12 +255,8 @@ fn parse_args() -> Result<Command, String> {
         let bx2 = args[5].parse::<i32>().map_err(|_| format!("bx2 格式错误: '{}'", args[5]))?;
         let bz2 = args[6].parse::<i32>().map_err(|_| format!("bz2 格式错误: '{}'", args[6]))?;
         let (dim_id, dim_name) = if let Some(raw) = args.get(7) {
-            match raw.to_lowercase().as_str() {
-                "overworld" | "0" => (0u8, "overworld".into()),
-                "nether" | "1"    => (1u8, "nether".into()),
-                "end" | "2"       => (2u8, "end".into()),
-                _ => return Err(format!("未知维度 '{}'，可选: overworld(0) nether(1) end(2)", raw)),
-            }
+            let d = parse_dimension_arg(raw)?;
+            (d, raw.to_string())
         } else {
             (0u8, "overworld".into())
         };
@@ -239,12 +281,8 @@ fn parse_args() -> Result<Command, String> {
     let z = args[4].parse::<i32>().map_err(|_| format!("z 格式错误: '{}'", args[4]))?;
 
     let (dim_id, dim_name) = if let Some(raw) = args.get(5) {
-        match raw.to_lowercase().as_str() {
-            "overworld" | "0" => (0u8, "overworld".into()),
-            "nether" | "1"    => (1u8, "nether".into()),
-            "end" | "2"       => (2u8, "end".into()),
-            _ => return Err(format!("未知维度 '{}'，可选: overworld(0) nether(1) end(2)", raw)),
-        }
+        let d = parse_dimension_arg(raw)?;
+        (d, raw.to_string())
     } else {
         (0u8, "overworld".into())
     };
@@ -458,19 +496,19 @@ fn read_level_dat(path: &str) -> Result<CompoundTag, String> {
 
 // ── Player scanning ──
 
+/// 前缀扫描统一使用 seek_to_first + 分类。
+/// 注意: fork 的 leveldb seek 存在索引定位缺陷（对部分 ASCII 前缀会跳过头），
+/// 全量扫描可避免。DB 键量级 ~10 万，扫描成本可接受。
 fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut results = Vec::new();
-    let prefixes: &[&[u8]] = &[b"~local_player", b"~player_", b"player_"];
-
-    for prefix in prefixes {
-        let mut iter = match db.new_iter() {
-            Ok(it) => it,
-            Err(_) => return results,
-        };
-        iter.seek(prefix);
-        while let Some((key, value)) = iter.next() {
-            if !key.starts_with(prefix) { break; }
-            if prefix == b"player_" && key.starts_with(b"player_server_") { continue; }
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => return results,
+    };
+    iter.seek_to_first();
+    while let Some((key, value)) = iter.next() {
+        if key.starts_with(b"~local_player") || key.starts_with(b"~player_")
+            || (key.starts_with(b"player_") && !key.starts_with(b"player_server_")) {
             results.push((key, value));
         }
     }
@@ -483,10 +521,11 @@ fn scan_all_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
         Ok(it) => it,
         Err(_) => return results,
     };
-    iter.seek(b"player_server_");
+    iter.seek_to_first();
     while let Some((key, value)) = iter.next() {
-        if !key.starts_with(b"player_server_") { break; }
-        results.push((key, value));
+        if key.starts_with(b"player_server_") {
+            results.push((key, value));
+        }
     }
     results
 }
@@ -497,10 +536,11 @@ fn scan_actor_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
         Ok(it) => it,
         Err(_) => return results,
     };
-    iter.seek(b"actorprefix");
+    iter.seek_to_first();
     while let Some((key, value)) = iter.next() {
-        if !key.starts_with(b"actorprefix") { break; }
-        results.push((key, value));
+        if key.starts_with(b"actorprefix") {
+            results.push((key, value));
+        }
     }
     results
 }
@@ -1010,19 +1050,28 @@ fn collect_chunk_keys(db: &mut DB, cx: i32, cz: i32) -> Vec<(Vec<u8>, Vec<u8>)> 
     results
 }
 
-fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i32, bz2: i32) {
+fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_filter: Option<u8>) {
     let cx1 = bx1.div_euclid(16);
     let cz1 = bz1.div_euclid(16);
     let cx2 = bx2.div_euclid(16);
     let cz2 = bz2.div_euclid(16);
     let (cxa, cxb) = if cx1 <= cx2 { (cx1, cx2) } else { (cx2, cx1) };
     let (cza, czb) = if cz1 <= cz2 { (cz1, cz2) } else { (cz2, cz1) };
+    let dim_label = dim_filter.map(|d| match d { 0 => "主世界", 1 => "下界", 2 => "末地", _ => "?" }).unwrap_or("全部维度");
+    println!("  导出区域: 区块 ({}, {}) ~ ({}, {})  [{}{}]",
+        cxa, cza, cxb, czb, dim_label,
+        if dim_filter.is_none() { "（未指定维度时含全部维度）" } else { "" });
+
+    let matches_dim = |key: &[u8]| -> bool {
+        dim_filter.map_or(true, |f| extract_dim_from_key(key) == f)
+    };
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut chunk_list: Vec<String> = Vec::new();
-    let _total_count = (cxb - cxa + 1) * (czb - cza + 1);
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut current = 0;
 
+    // ── Phase 1: chunk keys in rect (dimension-filtered) ──
     for cx in cxa..=cxb {
         for cz in cza..=czb {
             let keys = collect_chunk_keys(db, cx, cz);
@@ -1030,6 +1079,8 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
             current += 1;
             chunk_list.push(format!("{},{}", cx, cz));
             for (key, value) in &keys {
+                if !matches_dim(key) { continue; }
+                *counts.entry("chunk").or_insert(0) += 1;
                 entries.push(serde_json::json!({
                     "key_hex": hex_encode(key),
                     "value_base64": general_purpose::STANDARD.encode(value),
@@ -1038,12 +1089,84 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
         }
     }
 
+    // ── Phase 2+3 (单次全扫): digp + actorprefix 收集 ──
+    // 注: fork 的 leveldb seek 存在缺陷(manifest last_seq 偏小时, seek 会定位到 seq 超快照的
+    // 隐藏版本而被过滤跳过, 导致部分前缀的键"找不到"), 全量扫描可避免。
+    // digp 键先收集(建立存储键链接集), actorprefix 键暂存, 扫描结束后按链接集筛选。
+    let mut actor_keys: std::collections::HashSet<[u8; 8]> = std::collections::HashSet::new();
+    let mut has_digp_world = false;
+    let mut actors_pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => { eprintln!("错误: 无法创建 DB 迭代器"); std::process::exit(1); }
+    };
+    iter.seek_to_first();
+    while let Some((key, value)) = iter.next() {
+        if key.starts_with(b"digp") {
+            has_digp_world = true;
+            let (cx, cz, dim) = match key.len() {
+                12 => (i32::from_le_bytes(key[4..8].try_into().unwrap()),
+                       i32::from_le_bytes(key[8..12].try_into().unwrap()), 0u8),
+                16 => (i32::from_le_bytes(key[4..8].try_into().unwrap()),
+                       i32::from_le_bytes(key[8..12].try_into().unwrap()),
+                       i32::from_le_bytes(key[12..16].try_into().unwrap()) as u8),
+                _ => continue,
+            };
+            if cx >= cxa && cx <= cxb && cz >= cza && cz <= czb && dim_filter.map_or(true, |f| dim == f) {
+                *counts.entry("digp").or_insert(0) += 1;
+                for chunk in value.chunks_exact(8) {
+                    if let Ok(k) = chunk.try_into() { actor_keys.insert(k); }
+                }
+                entries.push(serde_json::json!({
+                    "key_hex": hex_encode(&key),
+                    "value_base64": general_purpose::STANDARD.encode(&value),
+                }));
+            }
+        } else if key.starts_with(b"actorprefix") {
+            if key.len() == 19 {
+                actors_pending.push((key, value));
+            }
+        }
+    }
+
+    // actorprefix 筛选: 现代存储按 digp 链接(维度权威); 旧版无 digp 按 Pos 兜底
+    for (key, value) in &actors_pending {
+        let storage_key: [u8; 8] = key[11..19].try_into().unwrap();
+        let linked = if has_digp_world {
+            actor_keys.contains(&storage_key)
+        } else {
+            CompoundTag::from_binary_nbt(value, true).ok().map(|(tag, _)| {
+                if tag.get("identifier").and_then(|t| t.as_str()) == Some("minecraft:player") { return false; }
+                match tag.get("Pos") {
+                    Some(Tag::List(lv)) if lv.elements.len() >= 3 => {
+                        let x = tag_to_f64(&lv.elements[0]).unwrap_or(f64::NAN);
+                        let z = tag_to_f64(&lv.elements[2]).unwrap_or(f64::NAN);
+                        if !x.is_finite() || !z.is_finite() { return false; }
+                        let cx = (x as i64 as i32).div_euclid(16);
+                        let cz = (z as i64 as i32).div_euclid(16);
+                        cx >= cxa && cx <= cxb && cz >= cza && cz <= czb
+                    }
+                    _ => false,
+                }
+            }).unwrap_or(false)
+        };
+        if linked {
+            *counts.entry("actors").or_insert(0) += 1;
+            entries.push(serde_json::json!({
+                "key_hex": hex_encode(key),
+                "value_base64": general_purpose::STANDARD.encode(value),
+            }));
+        }
+    }
+
     if entries.is_empty() {
         println!("  未找到区块数据，导出空文件");
     }
 
+    // origin: 导出矩形的最小方块坐标（用于定点导入的偏移基准）
     let export = serde_json::json!({
         "total": entries.len(),
+        "origin": { "x": cxa * 16, "z": cza * 16 },
         "chunks": chunk_list,
         "entries": entries,
     });
@@ -1053,11 +1176,27 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
     std::fs::write(output_file, &json_str)
         .unwrap_or_else(|e| { eprintln!("错误: 写入文件失败: {}", e); std::process::exit(1); });
 
-    println!("  已导出 {} 个区块 (区块坐标 {}/{} ~ {}/{}) 共 {} 条记录 → {}",
-        current, cxa, cza, cxb, czb, entries.len(), output_file);
+    print!("  已导出 {} 个区块 (区块坐标 {}/{} ~ {}/{})", current, cxa, cza, cxb, czb);
+    for (cat, n) in &counts { print!(", {}: {}", cat, n); }
+    println!("  → {}", output_file);
 }
 
-fn cmd_import_chunks_inner(db: &mut DB, input_file: &str, skip_existing: bool) {
+#[derive(Default)]
+struct ImportStats {
+    chunks: usize,
+    by_tag: std::collections::BTreeMap<u8, usize>,
+    actors: usize,
+    digp: usize,
+    digp_dropped: usize,      // 值无法重建的 digp（未写入）
+    digp_refs_dropped: usize, // 重建时丢弃的未知 actor 引用
+    players_dropped: usize,   // 0x32 中丢弃的玩家实体
+    skipped: usize,
+    overflow: usize,          // 坐标溢出跳过的键
+    unchanged: usize,         // 值未变化(保持原值)
+    parse_failed: usize,      // NBT 解析失败的 actor（跳过）
+}
+
+fn cmd_import_chunks_inner(db: &mut DB, input_file: &str, skip_existing: bool, to: Option<(i32, i32)>, dim_override: Option<u8>, dry_run: bool) {
     let json_str = std::fs::read_to_string(input_file)
         .unwrap_or_else(|e| { eprintln!("错误: 读取文件失败: {}", e); std::process::exit(1); });
     let data: serde_json::Value = serde_json::from_str(&json_str)
@@ -1068,32 +1207,267 @@ fn cmd_import_chunks_inner(db: &mut DB, input_file: &str, skip_existing: bool) {
         None => { eprintln!("错误: JSON 格式无效，缺少 entries 字段"); std::process::exit(1); }
     };
 
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
+    // ── 平移参数: origin → (dx_chunks, dz_chunks) ──
+    let reloc = to.map(|(bx, bz)| {
+        let origin_cx: (i32, i32) = match (data["origin"]["x"].as_i64(), data["origin"]["z"].as_i64()) {
+            (Some(x), Some(z)) => (x.div_euclid(16) as i32, z.div_euclid(16) as i32),
+            _ => {
+                // 旧文件无 origin 字段: 以文件内最小区块坐标为基准
+                let mut min_cx = i32::MAX; let mut min_cz = i32::MAX; let mut found = false;
+                for entry in entries {
+                    if let Some(k) = entry["key_hex"].as_str().and_then(|h| hex_decode(h).ok()) {
+                        if let Some((cx, cz, _, _, _)) = parse_chunk_key(&k) {
+                            min_cx = min_cx.min(cx); min_cz = min_cz.min(cz); found = true;
+                        }
+                    }
+                }
+                if !found {
+                    eprintln!("错误: 文件中无区块数据，无法定点导入"); std::process::exit(1);
+                }
+                println!("  文件无 origin 字段，以最小区块坐标 ({}, {}) 为基准", min_cx, min_cz);
+                (min_cx, min_cz)
+            }
+        };
+        let (to_cx, to_cz) = (bx.div_euclid(16), bz.div_euclid(16));
+        let (dx, dz) = (to_cx - origin_cx.0, to_cz - origin_cx.1);
+        println!("  定点平移: 基准区块 ({}, {}) → 目标区块 ({}, {})  [偏移 ({}, {}) 区块 = ({}, {}) 方块]",
+            origin_cx.0, origin_cx.1, to_cx, to_cz, dx, dz, dx * 16, dz * 16);
+        (dx, dz)
+    });
 
-    for entry in entries {
-        let key_hex = entry["key_hex"].as_str()
-            .unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
-        let value_b64 = entry["value_base64"].as_str()
-            .unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
-
-        let key = hex_decode(key_hex)
-            .unwrap_or_else(|e| { eprintln!("错误: key 解析失败 ({}): {}", key_hex, e); std::process::exit(1); });
-        let value = general_purpose::STANDARD.decode(value_b64)
-            .unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
-
-        if skip_existing && db.get(&key).is_some() {
-            skipped += 1;
-            continue;
+    // ── 同位置导入: 所有条目原样写入（含 digp/actorprefix） ──
+    if reloc.is_none() {
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for entry in entries {
+            let key_hex = entry["key_hex"].as_str()
+                .unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+            let value_b64 = entry["value_base64"].as_str()
+                .unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
+            let key = hex_decode(key_hex)
+                .unwrap_or_else(|e| { eprintln!("错误: key 解析失败: {}", e); std::process::exit(1); });
+            let value = general_purpose::STANDARD.decode(value_b64)
+                .unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
+            if skip_existing && db.get(&key).is_some() {
+                skipped += 1;
+                continue;
+            }
+            if dry_run { imported += 1; continue; }
+            db.put(&key, &value)
+                .unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
+            imported += 1;
         }
-
-        db.put(&key, &value)
-            .unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
-        imported += 1;
+        let total = data["total"].as_u64().unwrap_or(0) as usize;
+        println!("  导入完成: 总数 {}, 已导入 {}, 已跳过 {}", total, imported, skipped);
+        if dry_run { println!("  (dry-run 预览，未写入任何数据)"); }
+        return;
     }
 
+    let (dx, dz) = reloc.unwrap_or((0, 0));
+
+    // ── Pass 0 (仅 reloc): 清理目标区块的旧实体 ──
+    // 目标区块的 digp 将被覆盖; 旧 digp 引用的 actorprefix 若保留会成为孤儿,
+    // BDS 对孤儿的处理可能损坏数据(实测: digp 值被写成无效 UTF-8) → 导入前主动删除
+    let mut cleared_old_actors = 0usize;
+    if reloc.is_some() {
+        let mut target_digp_keys: Vec<Vec<u8>> = Vec::new();
+        for entry in entries {
+            let key_hex = entry["key_hex"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+            let key = match hex_decode(key_hex) { Ok(k) => k, Err(_) => continue };
+            if !key.starts_with(b"digp") { continue; }
+            if let Some(nk) = relocate_digp_key(&key, dx, dz, dim_override) {
+                target_digp_keys.push(nk);
+            }
+        }
+        for dk in &target_digp_keys {
+            let old_val = match db.get(dk) { Some(v) => v, None => continue };
+            for chunk in old_val.chunks_exact(8) {
+                if let Ok(k) = chunk.try_into() {
+                    let apk = build_actorprefix_key(k);
+                    if db.get(&apk).is_some() {
+                        cleared_old_actors += 1;
+                        if !dry_run {
+                            let _ = db.delete(&apk);
+                        }
+                    }
+                }
+            }
+        }
+        if cleared_old_actors > 0 {
+            println!("  {}目标区域旧实体 {} 个{}",
+                if dry_run { "将清理" } else { "已清理" },
+                cleared_old_actors,
+                if dry_run { " (dry-run 未执行)" } else { "" });
+        }
+    }
+
+    let mut stats = ImportStats::default();
+    let mut written: Vec<Vec<u8>> = Vec::new();  // 验证用
+
+    // ── Pass 1: actorprefix 实体（重生成 UniqueID + 新键） ──
+    let mut uid_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut key_map: std::collections::HashMap<[u8; 8], [u8; 8]> = std::collections::HashMap::new();
+    let mut uid_gen = UidGen::new();
+    const POS_FIELDS: &[&str] = &["Pos", "HomePos", "BedPosition", "SleepingPos",
+        "LastSleepPos", "RestingPos", "LastRestingPos", "PatrolTarget"];
+
+    let reloc_actors = reloc.is_some();
+    if reloc_actors {
+        for entry in entries {
+            let key_hex = entry["key_hex"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+            let value_b64 = entry["value_base64"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
+            let key = hex_decode(key_hex).unwrap_or_else(|e| { eprintln!("错误: key 解析失败: {}", e); std::process::exit(1); });
+            if !key.starts_with(b"actorprefix") || key.len() != 19 { continue; }
+            let value = general_purpose::STANDARD.decode(value_b64).unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
+            let old_key: [u8; 8] = key[11..19].try_into().unwrap();
+            let old_uid = decode_actor_storage_key(&old_key);
+
+            let new_uid = *uid_map.entry(old_uid).or_insert_with(|| uid_gen.next(db));
+            let new_key = build_actorprefix_key(encode_actor_storage_key(new_uid));
+
+            // 值改写: 位置字段 + UniqueID (+ 强制维度时同步 DimensionId)
+            let (kind, data) = unpack_value(&value);
+            let (mut ct, _) = match CompoundTag::from_binary_nbt(&data, true) {
+                Ok(v) => v,
+                Err(_) => { stats.parse_failed += 1; continue; }
+            };
+            for f in POS_FIELDS {
+                if let Some(t) = ct.get_mut(f) { shift_pos_list_tag(t, dx * 16, dz * 16); }
+            }
+            ct.set("UniqueID", Tag::Long(new_uid));
+            sync_actor_storage_key(&mut ct, &encode_actor_storage_key(new_uid));
+            if let Some(d) = dim_override { ct.set("DimensionId", Tag::Int(d as i32)); }
+            let bytes = ct.to_binary_nbt(true, false);
+            let new_value = repack_value(kind, &bytes);
+
+            if skip_existing && db.get(&new_key).is_some() { stats.skipped += 1; continue; }
+            // 登记映射供 Pass 3 重建 digp; 解析/跳过失败的实体不产生悬空引用
+            key_map.insert(old_key, encode_actor_storage_key(new_uid));
+            if dry_run { stats.actors += 1; continue; }
+            db.put(&new_key, &new_value).unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
+            stats.actors += 1;
+            written.push(new_key);
+        }
+    }
+
+    // ── Pass 2: 区块键（key 平移 + 值按类型改写） ──
+    for entry in entries {
+        let key_hex = entry["key_hex"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+        let value_b64 = entry["value_base64"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
+        let key = hex_decode(key_hex).unwrap_or_else(|e| { eprintln!("错误: key 解析失败: {}", e); std::process::exit(1); });
+        let value = general_purpose::STANDARD.decode(value_b64).unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
+
+        if key.starts_with(b"actorprefix") || key.starts_with(b"digp") { continue; }
+
+        let parsed = parse_chunk_key(&key);
+        let new_key = if reloc.is_some() {
+            match parsed {
+                Some(_) => match relocate_chunk_key(&key, dx, dz, dim_override) {
+                    Some(k) => k,
+                    None => { stats.overflow += 1; continue; }
+                },
+                None => key.clone(),  // 非区块键（理论上导出不含）: 原样保留
+            }
+        } else {
+            key.clone()
+        };
+
+        let new_value = if reloc.is_some() {
+            match parsed.map(|p| p.3) {
+                Some(0x31) => match shift_block_entity_value(&value, dx * 16, dz * 16) {
+                    Some(v) => v,
+                    None => { stats.unchanged += 1; value.clone() }
+                },
+                Some(0x33) => match shift_pending_ticks_value(&value, dx * 16, dz * 16) {
+                    Some(v) => v,
+                    None => { stats.unchanged += 1; value.clone() }
+                },
+                Some(0x32) => {
+                    let (v, players) = shift_entity_value(&value, dx * 16, dz * 16, &mut uid_map, &mut uid_gen, db);
+                    stats.players_dropped += players;
+                    match v { Some(v) => v, None => { stats.unchanged += 1; value.clone() } }
+                }
+                _ => value.clone(),  // 0x2F/0x34/0x36/0x38 等: 内容为局部数据, 原样
+            }
+        } else {
+            value.clone()
+        };
+
+        if skip_existing && db.get(&new_key).is_some() { stats.skipped += 1; continue; }
+        if dry_run { stats.chunks += 1; continue; }
+        db.put(&new_key, &new_value).unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
+        stats.chunks += 1;
+        if let Some((_, _, _, tag, _)) = parsed { *stats.by_tag.entry(tag).or_insert(0) += 1; }
+        written.push(new_key);
+    }
+
+    // ── Pass 3: digp（key 平移 + 值用新存储键重建） ──
+    if reloc.is_some() {
+        let (dx, dz) = reloc.unwrap();
+        for entry in entries {
+            let key_hex = entry["key_hex"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 key_hex"); std::process::exit(1); });
+            let value_b64 = entry["value_base64"].as_str().unwrap_or_else(|| { eprintln!("错误: 条目缺少 value_base64"); std::process::exit(1); });
+            let key = hex_decode(key_hex).unwrap_or_else(|e| { eprintln!("错误: key 解析失败: {}", e); std::process::exit(1); });
+            if !key.starts_with(b"digp") { continue; }
+            let value = general_purpose::STANDARD.decode(value_b64).unwrap_or_else(|e| { eprintln!("错误: base64 解码失败: {}", e); std::process::exit(1); });
+
+            let new_key = match relocate_digp_key(&key, dx, dz, dim_override) {
+                Some(k) => k,
+                None => { stats.overflow += 1; continue; }
+            };
+
+            // 值 = 8 字节存储键拼接; 逐个映射为新键, 未知引用丢弃
+            if value.len() % 8 != 0 {
+                stats.digp_dropped += 1;
+                eprintln!("  警告: digp 值长度 {} 非 8 的倍数，无法重建，跳过写入", value.len());
+                continue;
+            }
+            let mut new_value = Vec::with_capacity(value.len());
+            for chunk in value.chunks_exact(8) {
+                let k: [u8; 8] = chunk.try_into().unwrap();
+                match key_map.get(&k) {
+                    Some(nk) => new_value.extend_from_slice(nk),
+                    None => stats.digp_refs_dropped += 1,
+                }
+            }
+
+            if skip_existing && db.get(&new_key).is_some() { stats.skipped += 1; continue; }
+            if dry_run { stats.digp += 1; continue; }
+            db.put(&new_key, &new_value).unwrap_or_else(|e| { eprintln!("错误: DB 写入失败: {}", e); std::process::exit(1); });
+            stats.digp += 1;
+            written.push(new_key);
+        }
+    }
+
+    // ── 验证 ──
+    let verified = if dry_run { written.len() } else {
+        written.iter().filter(|k| db.get(k).is_some()).count()
+    };
     let total = data["total"].as_u64().unwrap_or(0) as usize;
-    println!("  导入完成: 总数 {}, 已导入 {}, 已跳过 {}", total, imported, skipped);
+
+    println!("\n═══ 区块导入报告 ═══");
+    println!("  文件总数: {} 条", total);
+    if reloc.is_some() {
+        let mut tag_desc: Vec<String> = stats.by_tag.iter()
+            .map(|(t, n)| format!("0x{:02x}:{}", t, n)).collect();
+        tag_desc.sort();
+        println!("  区块键: {} 条 [{}]{}", stats.chunks, tag_desc.join(" "),
+            if stats.unchanged > 0 { format!(" ({} 条值未变化)", stats.unchanged) } else { String::new() });
+        println!("  实体 (actorprefix): {} 个{}", stats.actors,
+            if stats.players_dropped > 0 { format!(" (丢弃玩家实体 {})", stats.players_dropped) } else { String::new() });
+        println!("  实体摘要 (digp): {} 个{}", stats.digp,
+            if stats.digp_refs_dropped > 0 { format!(" (丢弃未知引用 {})", stats.digp_refs_dropped) } else { String::new() });
+        if stats.digp_dropped > 0 { println!("  警告: {} 个 digp 因格式异常未写入", stats.digp_dropped); }
+        if stats.overflow > 0 { println!("  警告: {} 个键坐标溢出已跳过", stats.overflow); }
+    } else {
+        println!("  导入键值: {} 条", stats.chunks + stats.actors + stats.digp);
+    }
+    if stats.skipped > 0 { println!("  跳过已存在: {}", stats.skipped); }
+    if dry_run {
+        println!("\n  (dry-run 预览，未写入任何数据)");
+    } else {
+        println!("  验证: {} / {} 条写入确认", verified, written.len());
+    }
 }
 
 /// Known Bedrock chunk key discriminator bytes at position 8.
@@ -1135,6 +1509,287 @@ fn collect_all_chunk_keys_from_db(db: &mut DB) -> Vec<(Vec<u8>, i32, i32, u8)> {
         }
     }
     results
+}
+
+// ── Chunk relocation (定点平移) ──
+
+/// Parse a chunk key into (cx, cz, dim, tag, data_offset).
+/// Chunk keys: [cx:4][cz:4][dim:4 if dim!=0][tag:1][data]
+fn parse_chunk_key(key: &[u8]) -> Option<(i32, i32, u8, u8, usize)> {
+    if key.len() < 9 { return None; }
+    let cx = i32::from_le_bytes(key[0..4].try_into().unwrap());
+    let cz = i32::from_le_bytes(key[4..8].try_into().unwrap());
+    let (dim, tag_pos) = if key.len() >= 13 {
+        let d = i32::from_le_bytes(key[8..12].try_into().unwrap());
+        if d == 1 || d == 2 { (d as u8, 12usize) } else { (0u8, 8usize) }
+    } else { (0u8, 8usize) };
+    Some((cx, cz, dim, key[tag_pos], tag_pos + 1))
+}
+
+/// Rebuild a chunk key shifted by (dx_chunks, dz_chunks), optionally forcing a dimension.
+/// 0x34 (BlockExtraData) additionally carries block coords in the key: [bx:4][by:4][bz:4].
+/// Returns None on non-chunk key or coordinate overflow (caller skips with warning).
+fn relocate_chunk_key(key: &[u8], dx_chunks: i32, dz_chunks: i32, dim_override: Option<u8>) -> Option<Vec<u8>> {
+    let (cx, cz, dim, tag, data_off) = parse_chunk_key(key)?;
+    let new_cx = cx.checked_add(dx_chunks)?;
+    let new_cz = cz.checked_add(dz_chunks)?;
+    let new_dim = dim_override.unwrap_or(dim);
+    let mut out = Vec::with_capacity(key.len());
+    out.extend_from_slice(&new_cx.to_le_bytes());
+    out.extend_from_slice(&new_cz.to_le_bytes());
+    if new_dim != 0 { out.extend_from_slice(&new_dim.to_le_bytes()); }
+    out.push(tag);
+    if tag == 0x34 && key.len() >= data_off + 12 {
+        let bx = i32::from_le_bytes(key[data_off..data_off + 4].try_into().unwrap())
+            .checked_add(dx_chunks.checked_mul(16)?)?;
+        let by = i32::from_le_bytes(key[data_off + 4..data_off + 8].try_into().unwrap());
+        let bz = i32::from_le_bytes(key[data_off + 8..data_off + 12].try_into().unwrap())
+            .checked_add(dz_chunks.checked_mul(16)?)?;
+        out.extend_from_slice(&bx.to_le_bytes());
+        out.extend_from_slice(&by.to_le_bytes());
+        out.extend_from_slice(&bz.to_le_bytes());
+        out.extend_from_slice(&key[data_off + 12..]);
+    } else {
+        out.extend_from_slice(&key[data_off..]);
+    }
+    Some(out)
+}
+
+/// Parse a digp (actor digest) key into (cx, cz, dim, value_offset).
+/// digp keys: "digp" + [x:4][z:4] (+[dim:4] only for dim != 0).
+fn parse_digp_key(key: &[u8]) -> Option<(i32, i32, u8, usize)> {
+    if !key.starts_with(b"digp") { return None; }
+    match key.len() {
+        12 => Some((i32::from_le_bytes(key[4..8].try_into().unwrap()),
+                    i32::from_le_bytes(key[8..12].try_into().unwrap()), 0u8, 12usize)),
+        16 => Some((i32::from_le_bytes(key[4..8].try_into().unwrap()),
+                    i32::from_le_bytes(key[8..12].try_into().unwrap()),
+                    i32::from_le_bytes(key[12..16].try_into().unwrap()) as u8, 16usize)),
+        _ => None,
+    }
+}
+
+fn relocate_digp_key(key: &[u8], dx_chunks: i32, dz_chunks: i32, dim_override: Option<u8>) -> Option<Vec<u8>> {
+    let (cx, cz, dim, _) = parse_digp_key(key)?;
+    let new_cx = cx.checked_add(dx_chunks)?;
+    let new_cz = cz.checked_add(dz_chunks)?;
+    let new_dim = dim_override.unwrap_or(dim);
+    let mut out = Vec::with_capacity(key.len());
+    out.extend_from_slice(b"digp");
+    out.extend_from_slice(&new_cx.to_le_bytes());
+    out.extend_from_slice(&new_cz.to_le_bytes());
+    if new_dim != 0 { out.extend_from_slice(&new_dim.to_le_bytes()); }
+    Some(out)
+}
+
+/// Actor storage key (8 bytes BE: [neg_hi32(uid)][lo32(uid)]) ←→ UniqueID.
+fn decode_actor_storage_key(k: &[u8]) -> i64 {
+    let hi = u32::from_be_bytes(k[0..4].try_into().unwrap());
+    let lo = u32::from_be_bytes(k[4..8].try_into().unwrap());
+    ((hi.wrapping_neg() as i64) << 32) | (lo as i64)
+}
+
+fn encode_actor_storage_key(uid: i64) -> [u8; 8] {
+    let u = uid as u64;
+    let hi = (u >> 32) as u32;
+    let lo = u as u32;
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&hi.wrapping_neg().to_be_bytes());
+    out[4..8].copy_from_slice(&lo.to_be_bytes());
+    out
+}
+
+/// actorprefix 键 = "actorprefix"(11 字节) + 8 字节存储键(BE)。
+/// 注意: "actorprefix" 以 'x'(0x78) 结尾, 并非额外的标记字节。
+fn build_actorprefix_key(storage_key: [u8; 8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(19);
+    k.extend_from_slice(b"actorprefix");
+    k.extend_from_slice(&storage_key);
+    k
+}
+/// 把实体的 internalComponents.EntityStorageKeyComponent.StorageKey 同步为新的存储键。
+/// BDS 1.26 保存 actorprefix 时以该字段(而非仅 UniqueID)为准; Amulet-Core
+/// put_chunk_data 每次写入实体都会重写它。键字节全部 <0x80, 可直接作为 ASCII 字符串。
+fn sync_actor_storage_key(ct: &mut CompoundTag, storage: &[u8; 8]) {
+    let sk = std::str::from_utf8(storage).expect("storage key bytes must be <0x80").to_string();
+    let mut esc_comp = std::collections::HashMap::new();
+    esc_comp.insert("StorageKey".into(), Tag::String(sk));
+    if let Some(Tag::Compound(inner)) = ct.get_mut("internalComponents") {
+        inner.insert("EntityStorageKeyComponent".into(), Tag::Compound(esc_comp));
+    } else {
+        let mut esc = std::collections::HashMap::new();
+        esc.insert("EntityStorageKeyComponent".into(), Tag::Compound(esc_comp));
+        ct.set("internalComponents", Tag::Compound(esc));
+    }
+}
+
+
+/// Generate fresh actor UniqueIDs accepted & persisted by BDS 1.26.x.
+/// 实测结论(本机 BDS 1.26.45.1): actorprefix 存储键 8 字节若含 >=0x80 的字节,
+/// BDS 保存时会把记录当作“外来实体”处理(不写回 digp / 用 UTF-8 替换符改写), 重启后实体消失。
+/// 实测存活的键形如 00 00 10 01..2a / 00 00 01 01..2a (全部字节 <0x80),
+/// 即 key-hi = 0x1001..=0x102A, key-lo = 0x101..=0x12A; uid = -(hi<<32)+lo, 与 BDS 自身形态一致。
+/// 在该区间内递增并做 DB 碰撞检查。
+/// 可分配槽位 = 42(hi) × 42(lo) = 1764, 全部占用后继续导入会无法分配。
+struct UidGen { counter: u32 }
+impl UidGen {
+    fn new() -> Self {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u128).unwrap_or(0);
+        UidGen { counter: (t as u32) }
+    }
+    fn next(&mut self, db: &mut DB) -> i64 {
+        for _ in 0..(42 * 42 * 4) {
+            self.counter = self.counter.wrapping_add(1);
+            let hi = 0x1001 + (self.counter % 42);   // 0x1001..=0x102A
+            let lo = 0x101 + ((self.counter / 42) % 42); // 0x101..=0x12A
+            let uid = -((hi as i64) << 32) + (lo as i64);
+            let key = build_actorprefix_key(encode_actor_storage_key(uid));
+            if db.get(&key).is_none() { return uid; }
+        }
+        eprintln!("错误: 可用的 BDS 兼容实体 UID 槽位已耗尽(存档中定点导入实体过多)");
+        std::process::exit(1);
+    }
+}
+
+// ── NBT 坐标改写（自适应压缩：zlib / 裸 NBT） ──
+
+enum PayloadKind { Raw, Zlib }
+
+fn unpack_value(value: &[u8]) -> (PayloadKind, Vec<u8>) {
+    if value.len() > 2 && value[0] == 0x78 {
+        if let Ok(d) = decompress_to_vec_zlib(value) { return (PayloadKind::Zlib, d); }
+    }
+    (PayloadKind::Raw, value.to_vec())
+}
+
+fn repack_value(kind: PayloadKind, data: &[u8]) -> Vec<u8> {
+    match kind {
+        PayloadKind::Zlib => compress_to_vec_zlib(data, CompressionLevel::DefaultLevel as u8),
+        PayloadKind::Raw => data.to_vec(),
+    }
+}
+
+/// 平移 compound 内 x/z 整数字段（方块实体、计划刻元素）。
+fn shift_int_xyz(ct: &mut CompoundTag, dx: i32, dz: i32) -> bool {
+    let mut changed = false;
+    if let Some(v) = ct.get_mut("x") {
+        if let Tag::Int(n) = v {
+            if let Some(nn) = n.checked_add(dx) { *v = Tag::Int(nn); changed = true; }
+        }
+    }
+    if let Some(v) = ct.get_mut("z") {
+        if let Tag::Int(n) = v {
+            if let Some(nn) = n.checked_add(dz) { *v = Tag::Int(nn); changed = true; }
+        }
+    }
+    changed
+}
+
+/// 平移位置列表字段：List[3] 的 [0]=x, [2]=z（支持 Float/Double/Int）。
+fn shift_pos_list_tag(tag: &mut Tag, dx: i32, dz: i32) -> bool {
+    if let Tag::List(lv) = tag {
+        if lv.elements.len() < 3 { return false; }
+        let mut changed = false;
+        let mut add = |idx: usize, delta: i32| -> bool {
+            match &mut lv.elements[idx] {
+                Tag::Float(f) => { *f += delta as f32; true }
+                Tag::Double(d) => { *d += delta as f64; true }
+                Tag::Int(i) => { *i += delta; true }
+                _ => false,
+            }
+        };
+        changed |= add(0, dx);
+        changed |= add(2, dz);
+        changed
+    } else { false }
+}
+
+/// 0x31 方块实体值：逐个 NBT root 平移 x/z；失败返回 None（保持原值）。
+fn shift_block_entity_value(value: &[u8], dx: i32, dz: i32) -> Option<Vec<u8>> {
+    let (kind, data) = unpack_value(value);
+    let mut out = Vec::with_capacity(data.len());
+    let mut off = 0;
+    let mut changed_any = false;
+    while off < data.len() {
+        let (mut ct, consumed) = CompoundTag::from_binary_nbt(&data[off..], true).ok()?;
+        if consumed == 0 { break; }
+        changed_any |= shift_int_xyz(&mut ct, dx, dz);
+        out.extend_from_slice(&ct.to_binary_nbt(true, false));
+        off += consumed;
+    }
+    if !changed_any { return None; }
+    Some(repack_value(kind, &out))
+}
+
+/// 平移 HashMap 形式 compound 的 x/z 整数字段（计划刻元素等）。
+fn shift_int_xyz_map(map: &mut std::collections::HashMap<String, Tag>, dx: i32, dz: i32) -> bool {
+    let mut changed = false;
+    for (k, delta) in [("x", dx), ("z", dz)] {
+        if let Some(v) = map.get_mut(k) {
+            if let Tag::Int(n) = v {
+                if let Some(nn) = n.checked_add(delta) { *v = Tag::Int(nn); changed = true; }
+            }
+        }
+    }
+    changed
+}
+
+/// 0x33 计划刻值：root compound 的 tickList 数组，每项平移 x/z。
+fn shift_pending_ticks_value(value: &[u8], dx: i32, dz: i32) -> Option<Vec<u8>> {
+    let (kind, data) = unpack_value(value);
+    let (mut ct, _) = CompoundTag::from_binary_nbt(&data, true).ok()?;
+    let mut changed_any = false;
+    if let Some(lv) = ct.get_mut("tickList").and_then(|t| {
+        if let Tag::List(lv) = t { Some(lv) } else { None }
+    }) {
+        for elem in lv.elements.iter_mut() {
+            if let Tag::Compound(map) = elem {
+                changed_any |= shift_int_xyz_map(map, dx, dz);
+            }
+        }
+    }
+    if !changed_any { return None; }
+    let bytes = ct.to_binary_nbt(true, false);
+    Some(repack_value(kind, &bytes))
+}
+
+/// 0x32 实体值：平移位置字段 + 重生成 UniqueID；玩家实体不复制（丢弃）。
+fn shift_entity_value(
+    value: &[u8], dx: i32, dz: i32,
+    uid_map: &mut std::collections::HashMap<i64, i64>,
+    uid_gen: &mut UidGen, db: &mut DB,
+) -> (Option<Vec<u8>>, usize) {
+    let (kind, data) = unpack_value(value);
+    let mut out = Vec::with_capacity(data.len());
+    let mut off = 0;
+    let mut changed_any = false;
+    let mut players_dropped = 0;
+    const POS_FIELDS: &[&str] = &["Pos", "HomePos", "BedPosition", "SleepingPos",
+        "LastSleepPos", "RestingPos", "LastRestingPos", "PatrolTarget"];
+    while off < data.len() {
+        let (mut ct, consumed) = match CompoundTag::from_binary_nbt(&data[off..], true) {
+            Ok(v) => v,
+            Err(_) => break,  // 剩余字节无法解析则截断
+        };
+        if consumed == 0 { break; }
+        if ct.get("identifier").and_then(|t| t.as_str()) == Some("minecraft:player") {
+            players_dropped += 1;
+            off += consumed;
+            continue;
+        }
+        for f in POS_FIELDS {
+            if let Some(t) = ct.get_mut(f) { changed_any |= shift_pos_list_tag(t, dx, dz); }
+        }
+        if let Some(uid) = ct.get("UniqueID").and_then(|t| if let Tag::Long(v) = t { Some(*v) } else { None }) {
+            let new_uid = *uid_map.entry(uid).or_insert_with(|| uid_gen.next(db));
+            ct.set("UniqueID", Tag::Long(new_uid));
+            changed_any = true;
+        }
+        out.extend_from_slice(&ct.to_binary_nbt(true, false));
+        off += consumed;
+    }
+    (if changed_any { Some(repack_value(kind, &out)) } else { None }, players_dropped)
 }
 
 // ── Chunk deletion ──
@@ -1351,6 +2006,7 @@ fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
     // Phase 7: verify within same write session (MemTable is current)
     eprintln!("    正在验证删除结果...");
     let still_there = keys_to_delete.iter().filter(|k| db.get(k).is_some()).count();
+    let _ = db.flush();
     drop(db);
 
     // Count unique chunks for reporting
@@ -1422,11 +2078,14 @@ fn main() {
         Command::ImportActors { ref input_file, skip_existing, .. } => {
             let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
             opt.read_only = false;
+            opt.reuse_logs = false;
+            opt.reuse_manifest = false;
             let mut db = match DB::open(&db_path, opt) {
                 Ok(d) => d,
                 Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
             };
             cmd_import_actors(&mut db, input_file, skip_existing);
+            let _ = db.flush();
             println!();
             std::process::exit(0);
         }
@@ -1454,24 +2113,9 @@ fn main() {
             }
 
             if include_players {
-                // Collect player_*, ~* keys
-                for prefix in &[b"~local_player" as &[u8], b"~player_", b"player_"] {
-                    if let Ok(mut iter) = db_ro.new_iter() {
-                        iter.seek(prefix);
-                        while let Some((key, _)) = iter.next() {
-                            if !key.starts_with(prefix) { break; }
-                            if *prefix == b"player_" && key.starts_with(b"player_server_") { continue; }
-                            to_delete.push(key);
-                        }
-                    }
-                }
-                // player_server_* keys
-                if let Ok(mut iter) = db_ro.new_iter() {
-                    iter.seek(b"player_server_");
-                    while let Some((key, _)) = iter.next() {
-                        if !key.starts_with(b"player_server_") { break; }
-                        to_delete.push(key);
-                    }
+                // Collect player_*, ~* keys (全量扫描, 规避 fork seek 缺陷)
+                for (key, _) in scan_all_player_keys(&mut db_ro) {
+                    to_delete.push(key);
                 }
             }
 
@@ -1491,6 +2135,7 @@ fn main() {
                 let _ = db.delete(key);
             }
 
+            let _ = db.flush();
             if include_players {
                 println!("  已擦除全部实体(含玩家数据): 收集 {} 条, 实际删除 {}", collected, actual_deleted);
             } else {
@@ -1499,14 +2144,19 @@ fn main() {
             println!();
             std::process::exit(0);
         }
-        Command::ImportChunks { ref input_file, skip_existing, .. } => {
+        Command::ImportChunks { ref input_file, skip_existing, to, dim_override, dry_run, .. } => {
             let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
             opt.read_only = false;
+            opt.reuse_logs = false;      // 禁用日志复用: 写入进新日志, 下次打开/BDS 启动时可靠回放
+            opt.reuse_manifest = false;
             let mut db = match DB::open(&db_path, opt) {
                 Ok(d) => d,
                 Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
             };
-            cmd_import_chunks_inner(&mut db, input_file, skip_existing);
+            cmd_import_chunks_inner(&mut db, input_file, skip_existing, to, dim_override, dry_run);
+            if !dry_run {
+                let _ = db.flush();  // 确保 WAL 落盘 (process::exit 会跳过 Drop)
+            }
             println!();
             std::process::exit(0);
         }
@@ -1520,6 +2170,7 @@ fn main() {
                 Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
             };
             cmd_delete_chunks(&mut db, bx1, bz1, bx2, bz2, dim_id);
+            let _ = db.flush();
             drop(db);
             println!();
             std::process::exit(0);
@@ -1772,8 +2423,8 @@ fn main() {
             cmd_export_actors(&mut db, output_file, no_players);
         }
 
-        Command::ExportChunks { ref output_file, bx1, bz1, bx2, bz2, .. } => {
-            cmd_export_chunks(&mut db, output_file, bx1, bz1, bx2, bz2);
+        Command::ExportChunks { ref output_file, bx1, bz1, bx2, bz2, dim, .. } => {
+            cmd_export_chunks(&mut db, output_file, bx1, bz1, bx2, bz2, dim);
         }
 
         Command::EntityDensity { group_size, .. } => {

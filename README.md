@@ -36,10 +36,11 @@ world-inspector <世界路径> --import-actors <file>                   从 JSON
 world-inspector <世界路径> --import-actors <file> --skip-existing   导入实体（跳过已存在）
 
 区块管理：
-world-inspector <世界路径> --export-chunks <file> <bx> <bz>                导出单区块
-world-inspector <世界路径> --export-chunks <file> <bx1> <bz1> <bx2> <bz2>  导出区块范围
+world-inspector <世界路径> --export-chunks <file> <bx> <bz> [dimension]                导出单区块
+world-inspector <世界路径> --export-chunks <file> <bx1> <bz1> <bx2> <bz2> [dimension]  导出区块范围
 world-inspector <世界路径> --import-chunks <file>               从 JSON 导入区块（覆盖）
 world-inspector <世界路径> --import-chunks <file> --skip-existing  导入区块（跳过已存在）
+world-inspector <世界路径> --import-chunks <file> --to <bx> <bz> [--dimension <dim>] [--dry-run]  定点平移导入（复制到新位置）
 world-inspector <世界路径> --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimension]  删除区块范围
 world-inspector <世界路径> --batch-delete-chunks <file> [--invert]  从 JSON 批量删除区块
 
@@ -89,8 +90,16 @@ world-inspector /world --export-chunks chunks.json 0 64
 # 导出区块范围（矩形区域内的所有区块）
 world-inspector /world --export-chunks chunks.json -100 64 200 128
 
+# 仅导出主世界区块（可选维度过滤，末尾指定）
+world-inspector /world --export-chunks chunks.json -100 64 200 128 overworld
+
 # 导入区块到目标存档
 world-inspector /target-world --import-chunks chunks.json
+
+# 定点平移导入：把导出的机器区域复制到新位置（偏移按文件 origin 与 --to 计算）
+# 先 dry-run 预览，再正式导入
+world-inspector /target-world --import-chunks machine.json --to 1000 -500 --dimension overworld --dry-run
+world-inspector /target-world --import-chunks machine.json --to 1000 -500 --dimension overworld
 
 # 实体密度分析（按 2×2 区块组，显示实体最密集的前 5 个区域）
 world-inspector /world --entity-density 2
@@ -162,6 +171,25 @@ world-inspector /world --batch-delete-chunks regions.json --invert
 
 实体和区块分开管理，可按需选择性迁移。
 
+### 区块复制到新位置（定点导入）
+
+存档损坏丢失区域、无备份时的恢复手段：把完好机器/建筑的区块平移到丢失区域。
+
+```bash
+# 1. 导出完好机器所在矩形（指定维度）
+./wi /source --export-chunks machine.json <bx1> <bz1> <bx2> <bz2> overworld
+
+# 2. 预览目标位置写入计划
+./wi /target --import-chunks machine.json --to <bx> <bz> --dimension overworld --dry-run
+
+# 3. 正式导入（实体自动重新生成唯一 ID，源机器不受影响）
+./wi /target --import-chunks machine.json --to <bx> <bz> --dimension overworld
+
+# 4. 进游戏验证：目标区域出现机器（含方块实体/实体），源机器完好
+```
+
+注意：目标区域若有残留数据会被覆盖；`--skip-existing` 可改为跳过已存在键。
+
 ### 导出文件格式
 
 所有导出的 JSON 文件通用结构：
@@ -169,6 +197,7 @@ world-inspector /world --batch-delete-chunks regions.json --invert
 ```json
 {
   "total": 100,
+  "origin": { "x": -64, "z": -64 },
   "entries": [
     {
       "key_hex": "6163746f72707265666978...",
@@ -181,9 +210,30 @@ world-inspector /world --batch-delete-chunks regions.json --invert
 ```
 
 - `total` — 条目总数
+- `origin` — 导出矩形的最小方块坐标（仅区块导出时存在，定点导入的偏移基准）
 - `entries` — 键值对列表（key 为 hex 编码，value 为 base64 编码）
 - `identifier` — 实体类型（仅实体导出时存在）
 - `chunks` — 已导出区块列表（仅区块导出时存在）
+
+### 定点平移导入（区块复制）
+
+`--import-chunks --to <bx> <bz>` 将导出的区块区域整体平移到新位置（偏移 = `--to` 减去文件 `origin`，按区块对齐）。典型场景：把完好机器/建筑的区块复制到损坏丢失的区域作为替补。
+
+平移时自动处理：
+
+- **区块键** — 坐标字段改写（下界/末地键含维度字段，自动保留或按 `--dimension` 改写）
+- **方块实体 (0x31)** — NBT 内 x/z 平移（箱子、命令方块等）
+- **计划刻 (0x33)** — tickList 每项 x/z 平移
+- **实体** — actorprefix 记录平移位置字段、**重新生成 UniqueID**（BDS 兼容小 ID 区间，避免与源实体冲突并保证重启后仍被 BDS 持久化）、同步写入 `internalComponents...StorageKey`、digp 摘要同步重建；0x32 旧式实体数据同步处理；玩家实体不复制
+- **其余键**（子区块/生物群系/版本等）— 内容为区块局部数据，原样搬运
+- **导入前清理** — 目标区块原有的实体（旧 digp 引用）会被主动删除，避免成为孤儿实体导致 BDS 数据损坏（实测 1.21.x BDS 对孤儿实体的修复流程会把 digp 值写坏）
+
+注意：
+
+- 目标区域已有键默认覆盖；`--skip-existing` 可跳过已存在键（旧实体清理仍执行）
+- 实体内部交叉引用（拴绳/载具/村民 POI 记忆）不随平移改写
+- 先 `--dry-run` 预览写入计划（dry-run 不执行清理与写入）
+- 跨维度复制：`--dimension <dim>` 强制改写所有键的目标维度（如主世界→下界），坐标不做缩放
 
 ## 玩家 key
 
@@ -201,9 +251,10 @@ CLI 自动跟随 `ServerId` 链接显示关联数据。
 
 - 只读命令以 `read_only` 模式打开 LevelDB，不修改数据
 - 写命令（wipe/import/delete）以读写模式独立打开 DB，不影响只读功能
+- 写命令禁用日志复用（`reuse_logs=false`）并在退出前 flush WAL，保证数据落盘、BDS 启动时可靠回放
 - delete 操作写入 LevelDB 删除标记（tombstone）到 WAL
 - 删除验证：CLI 在同一 write 会话内验证删除成功 ✅（输出 `验证: 目标区域数据已全部删除`）
-- 只读查看（如 `--export-chunks`）：WAL 回放机制导致 read-only 模式可能仍显示旧数据，以同会话验证为准
+- 只读查看（如 `--export-chunks`）：read-only 模式不回放 WAL，可能显示旧数据，以同会话验证为准
 - 对 BDS 生效：BDS 以 write-mode 启动时自动回放 WAL，删除标记被正确识别，数据清除
 - 导出的 JSON 文件支持 `--skip-existing` 可重入安全地增量导入
 

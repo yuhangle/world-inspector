@@ -207,19 +207,18 @@ fn tag_to_i32(tag: &Tag) -> Option<i32> {
     match tag { Tag::Byte(v) => Some(*v as i32), Tag::Short(v) => Some(*v as i32), Tag::Int(v) => Some(*v), Tag::Long(v) => Some(*v as i32), _ => None }
 }
 
+// 前缀扫描统一用 seek_to_first + 分类（fork 的 leveldb seek 对部分前缀有索引定位缺陷）。
+
 fn scan_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut results = Vec::new();
-    let prefixes: &[&[u8]] = &[b"~local_player", b"~player_", b"player_"];
-
-    for prefix in prefixes {
-        let mut iter = match db.new_iter() {
-            Ok(it) => it,
-            Err(_) => return results,
-        };
-        iter.seek(prefix);
-        while let Some((key, value)) = iter.next() {
-            if !key.starts_with(prefix) { break; }
-            if prefix == b"player_" && key.starts_with(b"player_server_") { continue; }
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => return results,
+    };
+    iter.seek_to_first();
+    while let Some((key, value)) = iter.next() {
+        if key.starts_with(b"~local_player") || key.starts_with(b"~player_")
+            || (key.starts_with(b"player_") && !key.starts_with(b"player_server_")) {
             results.push((key, value));
         }
     }
@@ -232,10 +231,11 @@ fn scan_all_player_keys(db: &mut DB) -> Vec<(Vec<u8>, Vec<u8>)> {
         Ok(it) => it,
         Err(_) => return results,
     };
-    iter.seek(b"player_server_");
+    iter.seek_to_first();
     while let Some((key, value)) = iter.next() {
-        if !key.starts_with(b"player_server_") { break; }
-        results.push((key, value));
+        if key.starts_with(b"player_server_") {
+            results.push((key, value));
+        }
     }
     results
 }
