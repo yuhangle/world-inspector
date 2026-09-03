@@ -221,7 +221,7 @@ world-inspector /world --batch-delete-chunks regions.json --invert
 
 平移时自动处理：
 
-- **区块键** — 坐标字段改写（下界/末地键含维度字段，自动保留或按 `--dimension` 改写）
+- **区块键** — 坐标字段改写（下界/末地键含维度字段，自动保留或按 `--dimension` 改写）；自动识别两种下界/末地键格式：1.21 时代的 4 字节维度字段，以及 BDS 1.26+ 保存时使用的 1 字节维度标记
 - **方块实体 (0x31)** — NBT 内 x/z 平移（箱子、命令方块等）
 - **计划刻 (0x33)** — tickList 每项 x/z 平移
 - **实体** — actorprefix 记录平移位置字段、**重新生成 UniqueID**（BDS 兼容小 ID 区间，避免与源实体冲突并保证重启后仍被 BDS 持久化）、同步写入 `internalComponents...StorageKey`、digp 摘要同步重建；0x32 旧式实体数据同步处理；玩家实体不复制

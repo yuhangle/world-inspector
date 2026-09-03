@@ -1113,12 +1113,17 @@ fn cmd_export_chunks(db: &mut DB, output_file: &str, bx1: i32, bz1: i32, bx2: i3
             prefix.extend_from_slice(&cx.to_le_bytes());
             prefix.extend_from_slice(&cz.to_le_bytes());
             for (key, value) in collect_prefix(db, &prefix) {
-                // 12 字节: 主世界无维度字段; 16 字节: bytes[12..16] 为维度 LE i32
+                // 12B: 主世界无维度; 13B: BDS 1.26+ 1 字节维度标记(仅 1/2); 16B: 旧格式 4 字节维度
                 let dim = match key.len() {
                     12 => 0u8,
+                    13 => {
+                        let d = key[12];
+                        if d == 1 || d == 2 { d } else { continue }
+                    }
                     16 => i32::from_le_bytes(key[12..16].try_into().unwrap()) as u8,
                     _ => continue,
                 };
+                if dim > 2 { continue; }
                 if !dim_filter.map_or(true, |f| dim == f) { continue; }
                 *counts.entry("digp").or_insert(0) += 1;
                 for chunk in value.chunks_exact(8) {
@@ -1493,15 +1498,27 @@ fn is_chunk_key(key: &[u8]) -> bool {
         && !key.starts_with(b"digp")
 }
 
-/// Extract the dimension id from a chunk key.
-/// Overworld (dim=0): key = [cx:4][cz:4][tag:1][data]  (9-10 bytes, no dim field)
-/// Nether/End  (dim=1/2): key = [cx:4][cz:4][dim:4][tag:1][data]  (13-14 bytes, dim at [8..12])
-fn extract_dim_from_key(key: &[u8]) -> u8 {
+/// Chunk key layout: returns (dim, tag_pos, dim_field_len).
+/// - Overworld:              [cx:4][cz:4][tag][data]             (tag_pos=8,  no dim)
+/// - Nether/End 旧格式(1.21): [cx:4][cz:4][dim:4][tag][data]      (dim at [8..12], tag_pos=12)
+/// - Nether/End 新格式(BDS 1.26+ 保存时迁移): [cx:4][cz:4][dim:1][tag][data]
+///                                                              (dim at [8],    tag_pos=9)
+/// 旧格式优先判定: 旧键的 [8]==1/2 且 [9..12]==0, 新键的 [9] 是 tag 字节(非 0)。
+fn chunk_dim_layout(key: &[u8]) -> Option<(u8, usize, usize)> {
+    if key.len() < 9 { return None; }
     if key.len() >= 13 {
-        let dim = i32::from_le_bytes(key[8..12].try_into().unwrap());
-        if dim == 1 || dim == 2 { return dim as u8; }
+        let d = i32::from_le_bytes(key[8..12].try_into().unwrap());
+        if d == 1 || d == 2 { return Some((d as u8, 12usize, 4usize)); }
     }
-    0
+    if key.len() >= 10 && (key[8] == 1 || key[8] == 2) {
+        return Some((key[8], 9usize, 1usize));
+    }
+    Some((0u8, 8usize, 0usize))
+}
+
+/// Extract the dimension id from a chunk key (识别新旧两种维度键格式)。
+fn extract_dim_from_key(key: &[u8]) -> u8 {
+    chunk_dim_layout(key).map(|l| l.0).unwrap_or(0)
 }
 
 /// Collect all chunk-related DB keys with their chunk coordinates and dimension.
@@ -1526,16 +1543,13 @@ fn collect_all_chunk_keys_from_db(db: &mut DB) -> Vec<(Vec<u8>, i32, i32, u8)> {
 
 // ── Chunk relocation (定点平移) ──
 
-/// Parse a chunk key into (cx, cz, dim, tag, data_offset).
-/// Chunk keys: [cx:4][cz:4][dim:4 if dim!=0][tag:1][data]
+/// Parse a chunk key into (cx, cz, dim, tag, data_offset)。
+/// 同时识别 1.21 旧格式(4 字节 dim)与 BDS 1.26+ 新格式(1 字节 dim 标记)。
 fn parse_chunk_key(key: &[u8]) -> Option<(i32, i32, u8, u8, usize)> {
     if key.len() < 9 { return None; }
     let cx = i32::from_le_bytes(key[0..4].try_into().unwrap());
     let cz = i32::from_le_bytes(key[4..8].try_into().unwrap());
-    let (dim, tag_pos) = if key.len() >= 13 {
-        let d = i32::from_le_bytes(key[8..12].try_into().unwrap());
-        if d == 1 || d == 2 { (d as u8, 12usize) } else { (0u8, 8usize) }
-    } else { (0u8, 8usize) };
+    let (dim, tag_pos, _) = chunk_dim_layout(key)?;
     Some((cx, cz, dim, key[tag_pos], tag_pos + 1))
 }
 
@@ -1543,16 +1557,26 @@ fn parse_chunk_key(key: &[u8]) -> Option<(i32, i32, u8, u8, usize)> {
 /// 0x34 (BlockExtraData) additionally carries block coords in the key: [bx:4][by:4][bz:4].
 /// Returns None on non-chunk key or coordinate overflow (caller skips with warning).
 fn relocate_chunk_key(key: &[u8], dx_chunks: i32, dz_chunks: i32, dim_override: Option<u8>) -> Option<Vec<u8>> {
-    let (cx, cz, dim, tag, data_off) = parse_chunk_key(key)?;
+    let cx = i32::from_le_bytes(key[0..4].try_into().unwrap());
+    let cz = i32::from_le_bytes(key[4..8].try_into().unwrap());
+    let (dim, tag_pos, dim_len) = chunk_dim_layout(key)?;
     let new_cx = cx.checked_add(dx_chunks)?;
     let new_cz = cz.checked_add(dz_chunks)?;
     let new_dim = dim_override.unwrap_or(dim);
+    let data_off = tag_pos + 1;
     let mut out = Vec::with_capacity(key.len());
     out.extend_from_slice(&new_cx.to_le_bytes());
     out.extend_from_slice(&new_cz.to_le_bytes());
-    if new_dim != 0 { out.extend_from_slice(&new_dim.to_le_bytes()); }
-    out.push(tag);
-    if tag == 0x34 && key.len() >= data_off + 12 {
+    if new_dim != 0 {
+        // 保留原键的维度字段形态; 主世界键被强制跨维度时默认写旧格式(4 字节)
+        if dim_len == 1 {
+            out.push(new_dim);
+        } else {
+            out.extend_from_slice(&(new_dim as i32).to_le_bytes());
+        }
+    }
+    out.push(key[tag_pos]);
+    if key[tag_pos] == 0x34 && key.len() >= data_off + 12 {
         let bx = i32::from_le_bytes(key[data_off..data_off + 4].try_into().unwrap())
             .checked_add(dx_chunks.checked_mul(16)?)?;
         let by = i32::from_le_bytes(key[data_off + 4..data_off + 8].try_into().unwrap());
@@ -1575,6 +1599,13 @@ fn parse_digp_key(key: &[u8]) -> Option<(i32, i32, u8, usize)> {
     match key.len() {
         12 => Some((i32::from_le_bytes(key[4..8].try_into().unwrap()),
                     i32::from_le_bytes(key[8..12].try_into().unwrap()), 0u8, 12usize)),
+        13 => {
+            let dim = key[12];
+            if dim == 1 || dim == 2 {
+                Some((i32::from_le_bytes(key[4..8].try_into().unwrap()),
+                      i32::from_le_bytes(key[8..12].try_into().unwrap()), dim, 13usize))
+            } else { None }
+        }
         16 => Some((i32::from_le_bytes(key[4..8].try_into().unwrap()),
                     i32::from_le_bytes(key[8..12].try_into().unwrap()),
                     i32::from_le_bytes(key[12..16].try_into().unwrap()) as u8, 16usize)),
@@ -1587,11 +1618,18 @@ fn relocate_digp_key(key: &[u8], dx_chunks: i32, dz_chunks: i32, dim_override: O
     let new_cx = cx.checked_add(dx_chunks)?;
     let new_cz = cz.checked_add(dz_chunks)?;
     let new_dim = dim_override.unwrap_or(dim);
+    let single_marker = key.len() == 13;
     let mut out = Vec::with_capacity(key.len());
     out.extend_from_slice(b"digp");
     out.extend_from_slice(&new_cx.to_le_bytes());
     out.extend_from_slice(&new_cz.to_le_bytes());
-    if new_dim != 0 { out.extend_from_slice(&new_dim.to_le_bytes()); }
+    if new_dim != 0 {
+        if single_marker {
+            out.push(new_dim);
+        } else {
+            out.extend_from_slice(&(new_dim as i32).to_le_bytes());
+        }
+    }
     Some(out)
 }
 
