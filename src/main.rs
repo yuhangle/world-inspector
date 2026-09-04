@@ -1849,6 +1849,27 @@ fn sort_pair(a: i32, b: i32) -> (i32, i32) {
     if a <= b { (a, b) } else { (b, a) }
 }
 
+/// 删除一个 digp 摘要键, 并删除它引用的 actorprefix 实体记录。
+/// 返回删除的实体数(记录本身由调用方决定是否计入 digp 键数)。
+fn delete_digp_and_actors(db: &mut DB, digp_key: &[u8]) -> usize {
+    let value = match db.get(digp_key) {
+        Some(v) => v.to_vec(),
+        None => return 0,
+    };
+    let mut cleared = 0usize;
+    for chunk in value.chunks_exact(8) {
+        if let Ok(k) = chunk.try_into() {
+            let actor_key = build_actorprefix_key(k);
+            if db.get(&actor_key).is_some() {
+                let _ = db.delete(&actor_key);
+                cleared += 1;
+            }
+        }
+    }
+    let _ = db.delete(digp_key);
+    cleared
+}
+
 fn cmd_delete_chunks(db: &mut DB, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_id: u8) {
     let (cxa, cxb) = sort_pair(bx1.div_euclid(16), bx2.div_euclid(16));
     let (cza, czb) = sort_pair(bz1.div_euclid(16), bz2.div_euclid(16));
@@ -1856,49 +1877,85 @@ fn cmd_delete_chunks(db: &mut DB, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_id
 
     let mut deleted = 0usize;
     let mut non_empty = 0usize;
+    let mut digp_deleted = 0usize;
+    let mut entities_cleared = 0usize;
 
     for cx in cxa..=cxb {
         for cz in cza..=czb {
+            let mut touched = false;
+
+            // 1) 删除区块键(仅目标维度)
             let keys = collect_chunk_keys(db, cx, cz);
-            if keys.is_empty() { continue; }
-            // Filter keys by dimension before deleting
             let to_delete: Vec<Vec<u8>> = keys.into_iter()
                 .filter(|(key, _)| extract_dim_from_key(key) == dim_id)
                 .map(|(key, _)| key)
                 .collect();
-            if to_delete.is_empty() { continue; }
-            non_empty += 1;
-            for key in &to_delete {
-                let _ = db.delete(key);
-                deleted += 1;
+            if !to_delete.is_empty() {
+                touched = true;
+                for key in &to_delete {
+                    let _ = db.delete(key);
+                    deleted += 1;
+                }
+            }
+
+            // 2) 删除该区块的 digp 摘要及其引用的实体(digp 键即使无区块键也可能存在)
+            let mut prefix = Vec::with_capacity(12);
+            prefix.extend_from_slice(b"digp");
+            prefix.extend_from_slice(&cx.to_le_bytes());
+            prefix.extend_from_slice(&cz.to_le_bytes());
+            for (key, _) in collect_prefix(db, &prefix) {
+                if let Some((dcx, dcz, ddim, _)) = parse_digp_key(&key) {
+                    if dcx == cx && dcz == cz && ddim == dim_id {
+                        touched = true;
+                        entities_cleared += delete_digp_and_actors(db, &key);
+                        digp_deleted += 1;
+                    }
+                }
+            }
+
+            if touched {
+                non_empty += 1;
             }
         }
     }
 
     // Post-delete verification (within same write-mode session, MemTable is current)
     let mut remaining = 0usize;
-    let mut remaining_chunks = 0usize;
+    let mut remaining_digp = 0usize;
     for cx in cxa..=cxb {
         for cz in cza..=czb {
             let keys = collect_chunk_keys(db, cx, cz);
-            if keys.is_empty() { continue; }
             let dim_keys: Vec<_> = keys.into_iter()
                 .filter(|(key, _)| extract_dim_from_key(key) == dim_id)
                 .collect();
-            if dim_keys.is_empty() { continue; }
-            remaining_chunks += 1;
-            remaining += dim_keys.len();
+            if !dim_keys.is_empty() {
+                remaining += dim_keys.len();
+            }
+            let mut prefix = Vec::with_capacity(12);
+            prefix.extend_from_slice(b"digp");
+            prefix.extend_from_slice(&cx.to_le_bytes());
+            prefix.extend_from_slice(&cz.to_le_bytes());
+            for (key, _) in collect_prefix(db, &prefix) {
+                if let Some((dcx, dcz, ddim, _)) = parse_digp_key(&key) {
+                    if dcx == cx && dcz == cz && ddim == dim_id {
+                        remaining_digp += 1;
+                    }
+                }
+            }
         }
     }
 
     println!("  区块删除完成: 范围 ({}, {}) ~ ({}, {}), 共 {} 区块",
         cxa, cza, cxb, czb, total_chunks);
-    println!("  删除 {} 条键值, 涉及 {} 区块, {} 区块无数据",
+    println!("  删除 {} 条区块键, 涉及 {} 区块, {} 区块无数据",
         deleted, non_empty, total_chunks - non_empty as i32);
-    if remaining == 0 && non_empty > 0 {
-        println!("  验证: 所有区块数据已成功删除");
-    } else if remaining > 0 {
-        println!("  验证: {} 条键值在 {} 个区块中未清除 (仅 WAL 写入, 待 compaction)", remaining, remaining_chunks);
+    if digp_deleted > 0 || entities_cleared > 0 {
+        println!("  清理区块摘要 (digp) {} 个, 关联实体 {} 个", digp_deleted, entities_cleared);
+    }
+    if remaining == 0 && remaining_digp == 0 && non_empty > 0 {
+        println!("  验证: 目标区域区块数据与实体已全部删除");
+    } else if remaining > 0 || remaining_digp > 0 {
+        println!("  验证: {} 条区块键 / {} 个摘要仍存留 (仅 WAL 写入, 待 compaction)", remaining, remaining_digp);
     }
 }
 
@@ -1975,6 +2032,22 @@ fn parse_and_validate_batch_file(input_file: &str) -> Result<Vec<ChunkRect>, Str
     Ok(chunk_rects)
 }
 
+/// Collect all digp keys as (key, cx, cz, dim), 用于批量删除时清理实体摘要。
+fn collect_all_digp_keys_from_db(db: &mut DB) -> Vec<(Vec<u8>, i32, i32, u8)> {
+    let mut results = Vec::new();
+    let mut iter = match db.new_iter() {
+        Ok(it) => it,
+        Err(_) => return results,
+    };
+    iter.seek_to_first();
+    while let Some((key, _)) = iter.next() {
+        if let Some((cx, cz, dim, _)) = parse_digp_key(&key) {
+            results.push((key, cx, cz, dim));
+        }
+    }
+    results
+}
+
 /// Check if a chunk coordinate with given dimension falls within any of the rectangles.
 fn is_chunk_in_rects(cx: i32, cz: i32, dim: u8, rects: &[ChunkRect]) -> bool {
     rects.iter().any(|r| r.dim_id == dim && cx >= r.cx1 && cx <= r.cx2 && cz >= r.cz1 && cz <= r.cz2)
@@ -2008,10 +2081,11 @@ fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
     };
 
     let all_keys = collect_all_chunk_keys_from_db(&mut db_ro);
-    println!("    DB 扫描: {} 条键值", all_keys.len());
+    let all_digp = collect_all_digp_keys_from_db(&mut db_ro);
+    println!("    DB 扫描: {} 条区块键, {} 条区块摘要(digp)", all_keys.len(), all_digp.len());
     drop(db_ro);
 
-    if all_keys.is_empty() {
+    if all_keys.is_empty() && all_digp.is_empty() {
         println!("    DB 中无区块数据");
         std::process::exit(0);
     }
@@ -2020,19 +2094,22 @@ fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
     let mode_label = if invert { "区域外" } else { "区域内" };
     eprintln!("    正在并行过滤 ({}模式)...", mode_label);
 
+    let select = |(_, cx, cz, dim): &(Vec<u8>, i32, i32, u8)| -> bool {
+        let inside = is_chunk_in_rects(*cx, *cz, *dim, merged);
+        if invert { !inside } else { inside }
+    };
     let keys_to_delete: Vec<Vec<u8>> = if invert {
-        all_keys.par_iter()
-            .filter(|(_, cx, cz, dim)| !is_chunk_in_rects(*cx, *cz, *dim, merged))
-            .map(|(key, _, _, _)| key.clone())
-            .collect()
+        all_keys.par_iter().filter(|r| select(r)).map(|(key, _, _, _)| key.clone()).collect()
     } else {
-        all_keys.par_iter()
-            .filter(|(_, cx, cz, dim)| is_chunk_in_rects(*cx, *cz, *dim, merged))
-            .map(|(key, _, _, _)| key.clone())
-            .collect()
+        all_keys.par_iter().filter(|r| select(r)).map(|(key, _, _, _)| key.clone()).collect()
+    };
+    let digp_to_delete: Vec<Vec<u8>> = if invert {
+        all_digp.par_iter().filter(|r| select(r)).map(|(key, _, _, _)| key.clone()).collect()
+    } else {
+        all_digp.par_iter().filter(|r| select(r)).map(|(key, _, _, _)| key.clone()).collect()
     };
 
-    let collect_count = keys_to_delete.len();
+    let collect_count = keys_to_delete.len() + digp_to_delete.len();
     if collect_count == 0 {
         println!("    无待删除键值");
         std::process::exit(0);
@@ -2050,8 +2127,12 @@ fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
     };
 
     // Phase 6: delete
+    let mut entities_cleared = 0usize;
     for key in &keys_to_delete {
         let _ = db.delete(key);
+    }
+    for dkey in &digp_to_delete {
+        entities_cleared += delete_digp_and_actors(&mut db, dkey);
     }
 
     // Phase 7: verify within same write session (MemTable is current)
@@ -2071,7 +2152,10 @@ fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
     }
 
     let unique_chunks = chunks_set.len();
-    println!("    ✓ 删除 {} 条键值, 涉及 {} 区块", collect_count, unique_chunks);
+    println!("    ✓ 删除 {} 条键值(含 digp {} 条), 涉及 {} 区块", collect_count, digp_to_delete.len(), unique_chunks);
+    if entities_cleared > 0 {
+        println!("    ✓ 清理关联实体 {} 个", entities_cleared);
+    }
 
     if still_there == 0 {
         println!("    ✓ 验证: 目标区域数据已全部删除（同会话确认）");
