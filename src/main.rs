@@ -119,7 +119,9 @@ fn print_help() {
   world-inspector /path/to/world --import-chunks <file> --skip-existing  跳过已存在 key
   world-inspector /path/to/world --import-chunks <file> --to <bx> <bz> [--dimension <dim>] [--dry-run]  定点平移导入(复制到新位置)
   world-inspector /path/to/world --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimension]  删除区块范围
-  world-inspector /path/to/world --batch-delete-chunks <file> [--invert]  从 JSON 批量删除区块
+  world-inspector /path/to/world --batch-delete-chunks <file>           删除 JSON 指定区域内的区块
+  world-inspector /path/to/world --batch-delete-chunks <file> --invert  保留 JSON 指定区域，删除区域外全部区块
+                                                                       (未在 JSON 中列出的维度也会被删除)
 
 实体密度分析：
 

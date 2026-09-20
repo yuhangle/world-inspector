@@ -42,7 +42,8 @@ world-inspector <世界路径> --import-chunks <file>               从 JSON 导
 world-inspector <世界路径> --import-chunks <file> --skip-existing  导入区块（跳过已存在）
 world-inspector <世界路径> --import-chunks <file> --to <bx> <bz> [--dimension <dim>] [--dry-run]  定点平移导入（复制到新位置）
 world-inspector <世界路径> --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimension]  删除区块范围
-world-inspector <世界路径> --batch-delete-chunks <file> [--invert]  从 JSON 批量删除区块
+world-inspector <世界路径> --batch-delete-chunks <file>            删除 JSON 指定区域内的区块
+world-inspector <世界路径> --batch-delete-chunks <file> --invert   保留 JSON 指定区域，删除区域外全部区块
 
 实体密度分析：
 world-inspector <世界路径> --entity-density [N]              按 N×N 区块组统计实体密度 Top 5
@@ -113,7 +114,7 @@ world-inspector /world --delete-chunks -50 -50 50 50 nether
 # 从 JSON 批量删除区块
 world-inspector /world --batch-delete-chunks regions.json
 
-# 反选删除：删除指定区域之外的所有区块
+# 反选删除：保留指定区域，删除区域之外的所有区块
 world-inspector /world --batch-delete-chunks regions.json --invert
 ```
 
@@ -145,6 +146,8 @@ world-inspector /world --batch-delete-chunks regions.json --invert
 - `regions` — 区域数组（至少 1 项），每项包含：
   - `dimension` — 维度：`0` / `"overworld"` | `1` / `"nether"` | `2` / `"end"`
   - `x1`, `z1`, `x2`, `z2` — 方块坐标的两个对角点
+
+`--invert` 是全局反选：只保留 JSON 中列出的区域，删除其他所有区块。未在 JSON 中列出的维度不匹配任何保留区域，因此也会被清空；若要保留下界或末地，必须分别添加对应维度的保留区域。
 
 
 
