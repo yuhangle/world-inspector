@@ -45,6 +45,9 @@ world-inspector <世界路径> --delete-chunks <bx1> <bz1> <bx2> <bz2> [dimensio
 world-inspector <世界路径> --batch-delete-chunks <file>            删除 JSON 指定区域内的区块
 world-inspector <世界路径> --batch-delete-chunks <file> --invert   保留 JSON 指定区域，删除区域外全部区块
 
+存档维护：
+world-inspector <世界路径> --compact                            对 LevelDB 执行全量 compaction，回收删除后的磁盘空间
+
 实体密度分析：
 world-inspector <世界路径> --entity-density [N]              按 N×N 区块组统计实体密度 Top 5
 ```
@@ -116,7 +119,13 @@ world-inspector /world --batch-delete-chunks regions.json
 
 # 反选删除：保留指定区域，删除区域之外的所有区块
 world-inspector /world --batch-delete-chunks regions.json --invert
+
+# 删除后全量压缩 LevelDB，回收旧 SST/tombstone 占用的磁盘空间
+# 执行前必须停止服务端
+world-inspector /world --compact
 ```
+
+`--compact` 会遍历并合并 LevelDB 的键范围，使删除产生的 tombstone 和被覆盖的旧值真正从磁盘上消失。它不会自动删除玩家、全局数据或孤立实体，只负责回收已经逻辑删除的数据空间。该操作可能耗时较长，并需要一定的临时磁盘空间；请务必先停止服务端再执行。
 
 ### 批量删除 JSON 文件格式
 

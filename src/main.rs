@@ -69,6 +69,7 @@ enum Command {
     EntityDensity { world_path: String, group_size: u32 },
     DeleteChunks { world_path: String, bx1: i32, bz1: i32, bx2: i32, bz2: i32, dim_id: u8, dim_name: String },
     BatchDeleteChunks { world_path: String, input_file: String, invert: bool },
+    Compact { world_path: String },
 }
 
 fn print_help() {
@@ -85,6 +86,7 @@ fn print_help() {
        world-inspector <world_path> --import-chunks <file> [--skip-existing]
        world-inspector <world_path> --import-actors <file> [--skip-existing]
        world-inspector <world_path> --entity-density [N]
+       world-inspector <world_path> --compact
 
 查询坐标方块：
   world-inspector /path/to/world -3 -60 -3          查主世界方块
@@ -122,6 +124,10 @@ fn print_help() {
   world-inspector /path/to/world --batch-delete-chunks <file>           删除 JSON 指定区域内的区块
   world-inspector /path/to/world --batch-delete-chunks <file> --invert  保留 JSON 指定区域，删除区域外全部区块
                                                                        (未在 JSON 中列出的维度也会被删除)
+
+存档维护：
+  world-inspector /path/to/world --compact  对 LevelDB 执行全量 compaction，回收删除后的磁盘空间
+                                           (执行前必须停止服务端；可能耗时并需要临时磁盘空间)
 
 实体密度分析：
 
@@ -268,6 +274,10 @@ fn parse_args() -> Result<Command, String> {
     if args.len() >= 4 && args[2] == "--batch-delete-chunks" {
         let invert = args[4..].iter().any(|a| a == "--invert");
         return Ok(Command::BatchDeleteChunks { world_path, input_file: args[3].clone(), invert });
+    }
+
+    if args.len() == 3 && args[2] == "--compact" {
+        return Ok(Command::Compact { world_path });
     }
 
     if args.len() == 2 {
@@ -2170,6 +2180,20 @@ fn cmd_batch_delete_chunks(world_path: &str, input_file: &str, invert: bool) {
     println!("    {}: {} 区块, {} 键值", db_path, unique_chunks, collect_count);
 }
 
+fn cmd_compact(db: &mut DB) {
+    println!("  正在执行 LevelDB 全量 compaction...");
+
+    // BDS 的用户键都远短于 1024 字节；0xff 作为最大字节边界，
+    // 可确保从最小键到最大键的完整范围都被纳入 compaction。
+    let upper_bound = [0xffu8; 1024];
+    if let Err(e) = db.compact_range(b"", &upper_bound) {
+        eprintln!("错误: compaction 失败: {}", e);
+        std::process::exit(1);
+    }
+
+    println!("  ✓ compaction 完成");
+}
+
 // ── Main ──
 
 fn main() {
@@ -2183,7 +2207,8 @@ fn main() {
         Command::ShowInfo { world_path } | Command::ListPlayers { world_path } | Command::ListActors { world_path } | Command::ShowPlayer { world_path, .. }
             | Command::WipeActors { world_path, .. } | Command::ExportActors { world_path, .. } | Command::ExportChunks { world_path, .. }
             | Command::ImportActors { world_path, .. } | Command::ImportChunks { world_path, .. }
-            | Command::EntityDensity { world_path, .. } | Command::BatchDeleteChunks { world_path, .. } => (world_path.as_str(), 0u8, "overworld"),
+            | Command::EntityDensity { world_path, .. } | Command::BatchDeleteChunks { world_path, .. }
+            | Command::Compact { world_path } => (world_path.as_str(), 0u8, "overworld"),
         Command::DeleteChunks { world_path, dim_id, dim_name, .. } => (world_path.as_str(), *dim_id, dim_name.as_str()),
     };
 
@@ -2314,6 +2339,21 @@ fn main() {
         }
         Command::BatchDeleteChunks { ref input_file, invert, .. } => {
             cmd_batch_delete_chunks(world_path, input_file, invert);
+            println!();
+            std::process::exit(0);
+        }
+        Command::Compact { .. } => {
+            let mut opt = mcpe_options(CompressionLevel::DefaultLevel as u8);
+            opt.reuse_logs = false;
+            opt.reuse_manifest = false;
+            opt.read_only = false;
+            let mut db = match DB::open(&db_path, opt) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("错误: DB 打开失败: {}", e); std::process::exit(1); }
+            };
+            cmd_compact(&mut db);
+            let _ = db.flush();
+            drop(db);
             println!();
             std::process::exit(0);
         }
@@ -2569,7 +2609,7 @@ fn main() {
         }
 
         Command::ImportActors { .. } | Command::WipeActors { .. } | Command::ImportChunks { .. }
-            | Command::DeleteChunks { .. } | Command::BatchDeleteChunks { .. } => {
+            | Command::DeleteChunks { .. } | Command::BatchDeleteChunks { .. } | Command::Compact { .. } => {
             unreachable!()
         }
     }
